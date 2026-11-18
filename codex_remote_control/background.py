@@ -36,6 +36,13 @@ def _path(thread_id: str) -> Path:
     return state_dir() / f"{thread_id}.json"
 
 
+def _private(directory: Path) -> None:
+    """Make the state directory, for its owner alone: a record holds a session's
+    link, and a bridge's log can hold the start of what was typed in the app."""
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+
+
 class Record:
     """A running bridge's own record. Hold it for the life of the process."""
 
@@ -60,7 +67,7 @@ class Record:
 def claim(thread_id: str) -> Record | None:
     """Take a thread for this process. None if another bridge is serving it."""
     path = _path(thread_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _private(path.parent)
     file = open(path, "a+")
     for _ in range(20):  # a reader checking for a bridge holds the lock for an instant
         try:
@@ -97,7 +104,7 @@ def start(thread_id: str, options: list[str], *, timeout: float = 60.0) -> dict:
     log_path = _path(thread_id).with_suffix(".log")
     bridge = None
     if running(thread_id) is None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _private(log_path.parent)
         with open(log_path, "w") as log:
             bridge = subprocess.Popen(
                 [*_COMMAND, thread_id, *options],

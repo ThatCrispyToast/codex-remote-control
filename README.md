@@ -35,7 +35,7 @@ uses that login; `claude` doesn't have to be running.
 
    ```
    • You ran codex-rc
-     └ on Remote Control as "Codex: project": https://claude.ai/code/session_01B2vst…
+     └ on Remote Control as "Codex: project": https://claude.ai/code/session_01AbCdEf…
        take it off with: codex-rc --stop
    ```
 
@@ -87,9 +87,9 @@ codex-rc --thread <thread-id>  # a given thread, by the id `codex resume` takes
 It prints where to find both ends:
 
 ```
-thread   01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e  (/home/me/project)
-session  https://claude.ai/code/session_01B2vst…  (Codex: project)
-tui      codex resume 01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e
+thread   01234567-89ab-7cde-8f01-23456789abcd  (/home/me/project)
+session  https://claude.ai/code/session_01AbCdEf…  (Codex: project)
+tui      codex resume 01234567-89ab-7cde-8f01-23456789abcd
 ```
 
 `-m MODEL` sets the model of a new thread, `-v` logs what crosses the bridge,

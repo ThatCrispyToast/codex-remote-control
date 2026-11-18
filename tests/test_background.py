@@ -35,6 +35,7 @@ def test_a_bridge_holds_its_threads_record_while_it_runs(state):
     record.update(session="https://claude.ai/code/session_1")
     assert background.running(THREAD)["session"] == "https://claude.ai/code/session_1"
     assert background.claim(THREAD) is None  # one bridge to a thread
+    assert state.stat().st_mode & 0o777 == 0o700  # records and logs are their owner's alone
     assert background.running("thr-2") is None
     record.close()
     assert background.running(THREAD) is None

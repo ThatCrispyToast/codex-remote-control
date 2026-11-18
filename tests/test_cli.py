@@ -58,5 +58,5 @@ def test_a_session_keeps_the_name_it_was_given_until_it_is_given_another():
 def test_a_thread_id_given_as_a_name_is_caught(monkeypatch, capsys):
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     with pytest.raises(SystemExit):
-        cli.main(["01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e"])
-    assert "use --thread 01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e" in capsys.readouterr().err
+        cli.main(["01234567-89ab-7cde-8f01-23456789abcd"])
+    assert "use --thread 01234567-89ab-7cde-8f01-23456789abcd" in capsys.readouterr().err
