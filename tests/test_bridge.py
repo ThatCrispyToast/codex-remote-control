@@ -424,6 +424,19 @@ def test_a_closed_thread_ends_the_bridge(bridge):
         bridge._from_codex(note("thread/closed"))
 
 
+def test_stopping_mid_turn_closes_what_the_app_shows_as_open(bridge):
+    bridge._leave()
+    assert bridge.worker.log == []  # idle: nothing to close
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
+    bridge._from_codex(item("started", **COMMAND))  # `codex-remote-control --stop`, say
+    bridge._leave()
+    call = bridge.worker.events()[0]["message"]["content"][0]
+    closed = bridge.worker.events()[1]["message"]["content"][0]
+    assert (closed["type"], closed["tool_use_id"]) == ("tool_result", call["id"])
+    assert "stopped" in closed["content"]
+    assert bridge.worker.calls("end_turn")[-1][-1]["result"] == closed["content"]
+
+
 def test_backfill_writes_earlier_turns_oldest_first(bridge):
     def turn(n, status="completed"):
         return {"id": f"t{n}", "status": status, "durationMs": 5, "items": [
@@ -437,3 +450,17 @@ def test_backfill_writes_earlier_turns_oldest_first(bridge):
     written = bridge.worker.events()
     assert [event["type"] for event in written] == ["user", "assistant", "result"] * 2
     assert [event["message"]["content"] for event in written if event["type"] == "user"] == ["q1", "q2"]
+
+
+def test_a_turn_written_from_history_is_not_written_again(bridge):
+    """A turn that ends as the bridge attaches is in the history it backfills
+    and in the notifications it reads next."""
+    done = {"id": "turn-1", "status": "completed", "durationMs": 5, "items": [{**COMMAND, "status": "completed", "aggregatedOutput": "a.txt"}]}
+    bridge.codex.results["thread/turns/list"] = {"data": [done]}
+    bridge.backfill()
+    written = len(bridge.worker.log)
+    bridge._from_codex(item("completed", **done["items"][0]))
+    bridge._from_codex(turn_done())
+    assert len(bridge.worker.log) == written
+    bridge._from_codex(note("turn/started", turn={"id": "turn-2"}))  # the next turn is passed on as ever
+    assert bridge.turn == "turn-2"

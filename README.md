@@ -26,7 +26,34 @@ transcript, and its approval requests come up as permission cards.
 
 From a checkout, `uv run --project <checkout> codex-remote-control` runs it in
 whatever directory you are in, and `uv tool install <checkout>` puts the
-command on your PATH:
+command on your PATH.
+
+### From inside a Codex session
+
+In the session you want on Remote Control, type:
+
+```
+!codex-remote-control
+```
+
+```
+• You ran codex-remote-control
+  └ on Remote Control: https://claude.ai/code/session_01B2vst…
+    take it off with: codex-remote-control --stop
+```
+
+This is the counterpart of Claude Code's `/remote-control`. It is a `!` command
+because Codex's `/` commands are a fixed list that nothing can add to, while
+`!` runs a program of yours on the spot, outside the sandbox and without a
+model turn, and tells it which session it was typed in.
+
+The session then stays on Remote Control, also after you close the TUI: the
+thread lives on in Codex's background server, so the app can keep working it,
+and `codex resume` opens it again. Typing the command again shows the link
+again. `!codex-remote-control --stop` takes the session off, as does
+`codex-remote-control --stop <thread-id>` from a shell.
+
+### From a shell
 
 ```bash
 codex-remote-control                 # a new thread, working in this directory
@@ -88,7 +115,9 @@ by name, a reasoning summary as a thinking block.
 ## With the TUI
 
 Codex keeps one app-server per user and every `codex` TUI is a client of it.
-The bridge is another, so the thread it serves is the one a TUI opens:
+The bridge is another. So it can join the session a TUI has open, which is
+what `!codex-remote-control` does, and a TUI can open the thread a bridge
+serves:
 
 ```bash
 codex resume <thread-id>
@@ -123,6 +152,11 @@ finds its session again. Sessions can't be deleted, only archived (in the app):
 archive one and the bridge serving it stops, and the thread gets a new session
 the next time it is served.
 
+A thread has one bridge at a time. Each keeps a record under
+`~/.local/state/codex-remote-control/` (`$XDG_STATE_HOME`) for as long as it
+runs, which is what `--stop` goes by. A bridge started from inside a session
+logs there too, and one that ended by itself leaves that log behind.
+
 ## Limits
 
 - The app's features with no Codex counterpart are refused: rewind and the
@@ -134,6 +168,10 @@ the next time it is served.
   in the background. The transcript marks it interrupted.
 - If the Codex daemon restarts (it updates itself), the bridge reconnects, and
   a turn that was running then ends as an error.
+- A session Codex runs without its shared background server can't be joined.
+  That is one started with `-c`, `--enable`, `--disable` or `--search` (the TUI
+  says so in a startup warning), and `!codex-remote-control` there reports that
+  the thread "already has an active writer".
 
 ## Development
 
@@ -147,6 +185,7 @@ codex_remote_control/
   appserver.py   # Codex app-server client (JSON-RPC over the daemon's socket)
   translate.py   # Codex's vocabulary in Claude Code's: pure functions
   bridge.py      # one thread served as one session
+  background.py  # the bridge a session starts for itself, and stopping it
   cli.py         # the command
 tests/           # the bridge between a recorded app-server and worker
 ```

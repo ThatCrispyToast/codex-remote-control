@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 _RECONNECT_TRIES = 8
 # How often a reply that is still being written is passed on to its watchers.
 _STREAM_FLUSH_S = 0.3
+# What a tool call and a turn still open when the bridge is stopped end as.
+_LEFT = "Remote Control was stopped before this finished."
 
 
 def session_title(thread_name: str | None, cwd: str) -> str:
@@ -88,6 +90,7 @@ class Bridge:
         self.sent: set[str] = set()  # ids of the user messages this bridge submitted
         self.calls: dict[str, list[dict]] = {}  # running tool items' tool_use blocks, by item id
         self.interrupted: set[str] = set()  # tool items closed with their turn, whose real end is still to come
+        self.backfilled: set[str] = set()  # turns written from the thread's history, see backfill()
         self.prompts: dict[str, dict] = {}  # open permission prompts: request id -> the app-server request
         self.usage: dict | None = None  # the thread's token usage, as last reported
         self.usage_before: dict | None = None  # ... and as the running turn began
@@ -107,10 +110,14 @@ class Bridge:
         self._announce()
         self._adopt_running_turn()
         self._pump("rc", self.worker.events())
-        while True:
-            self._pump("codex", self.codex.messages())
-            self._serve()  # returns when the app-server connection drops
-            self._reconnect()
+        try:
+            while True:
+                self._pump("codex", self.codex.messages())
+                self._serve()  # returns when the app-server connection drops
+                self._reconnect()
+        except KeyboardInterrupt:
+            self._leave()
+            raise
 
     def _pump(self, source: str, items: Iterable) -> None:
         def pump() -> None:
@@ -144,6 +151,21 @@ class Bridge:
                 # this version doesn't know) is no reason to drop the session.
                 log.exception("could not handle %s", item if source == "rc" else item.get("method"))
 
+    def _leave(self) -> None:
+        """Stopped mid-turn, the bridge will not see that turn end, and the
+        `--stop` typed in a session always is mid-turn: it is a command in
+        one. Close what the app shows as open. Codex carries on regardless."""
+        if self.turn is None:
+            return
+        try:
+            for request_id in list(self.prompts):
+                self._withdraw_prompt(request_id)
+            for calls in self.calls.values():
+                self._send(*(worker_tool_result(call["id"], _LEFT) for call in calls))
+            self.worker.end_turn(*self.inputs, result=_LEFT)
+        except Exception:  # the stop goes ahead either way
+            log.debug("could not close the running turn", exc_info=True)
+
     def _adopt_running_turn(self) -> None:
         """A thread taken up mid-turn (one a TUI set going): find that turn, so
         the app shows the session working and can steer or stop it."""
@@ -157,7 +179,12 @@ class Bridge:
     def backfill(self, turns: int = 30) -> None:
         """Write the thread's latest turns into the session, for one made
         just now: a thread taken up mid-conversation then reads from its
-        start (or near it) in the app, not from this moment."""
+        start (or near it) in the app, not from this moment.
+
+        A turn that ended while the bridge was attaching is in this history
+        and also in the notifications waiting to be read (the command that
+        started the bridge from inside its session always is), so what Codex
+        still says about a turn written here is dropped."""
         listed = self.codex.request("thread/turns/list", {
             "threadId": self.thread_id, "limit": turns, "sortDirection": "desc", "itemsView": "full",
         })["data"]
@@ -165,6 +192,7 @@ class Bridge:
             events = [event for item in turn["items"] for event in translate.transcript(item, self.model)]
             if events and turn["status"] != "inProgress":
                 self.worker.send(*events, worker_result(duration_ms=turn.get("durationMs") or 0))
+                self.backfilled.add(turn["id"])
 
     def _reconnect(self) -> None:
         """The app-server went away, and the running turn with it. Close that
@@ -374,6 +402,8 @@ class Bridge:
         params = message.get("params") or {}
         if params.get("threadId", self.thread_id) != self.thread_id:
             return  # the daemon is shared: another thread's traffic
+        if (params.get("turnId") or (params.get("turn") or {}).get("id")) in self.backfilled:
+            return  # in the transcript already
         if not message["method"].endswith(("elta", "/updated")):
             log.debug("codex: %s %s", message["method"], (params.get("item") or {}).get("type", ""))
         if "id" in message:
