@@ -1,13 +1,14 @@
 """The bridge between a recorded Codex app-server and a recorded worker seat."""
 import pytest
-from claude_rc import Event
+from claude_rc import APIError, Event
 
+from codex_remote_control import workspace
 from codex_remote_control.appserver import AppServerError
 from codex_remote_control.bridge import Bridge, ThreadClosed, session_title
 
 THREAD = "thr-1"
 OPENED = {
-    "thread": {"id": THREAD, "cwd": "/w", "name": None},
+    "thread": {"id": THREAD, "cwd": "/w", "name": None, "cliVersion": "0.170.0"},
     "model": "gpt-x", "reasoningEffort": "low", "cwd": "/w",
     "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": {"type": "readOnly"},
     "collaborationMode": {"mode": "default"},
@@ -23,7 +24,10 @@ class Codex:
 
     def __init__(self):
         self.requests, self.answers, self.refuse = [], [], set()
-        self.results = {"turn/start": {"turn": {"id": "turn-1"}}, "model/list": MODELS, "thread/turns/list": {"data": []}}
+        self.results = {
+            "turn/start": {"turn": {"id": "turn-1"}}, "model/list": MODELS, "thread/turns/list": {"data": []},
+            "mcpServerStatus/list": {"data": []}, "review/start": {"turn": {"id": "turn-1"}},
+        }
 
     def request(self, method, params=None, **_):
         self.requests.append((method, params))
@@ -46,6 +50,8 @@ class Worker:
     def __init__(self):
         self.log, self.watched, self.client = [], True, self
         self.prompts = 0
+        self.held = []  # the session's own events, newest first, as `list_events` answers
+        self.files = {}  # what `download_file` has, by file uuid
 
     def send(self, *payloads, ephemeral=False):
         self.log += [("ephemeral" if ephemeral else "event", p) for p in payloads]
@@ -58,6 +64,14 @@ class Worker:
 
     def rename_session(self, session_id, title):
         self.log.append(("title", title))
+
+    def list_events(self, session_id, **_):
+        return self.held
+
+    def download_file(self, file_uuid, **_):
+        if file_uuid not in self.files:
+            raise APIError(404, "Missing files", None)
+        return self.files[file_uuid]
 
     def __getattr__(self, name):  # begin_turn, end_turn, respond, reject, report_*
         return lambda *args, **kw: self.log.append((name, *args, kw))
@@ -74,9 +88,21 @@ def bridge():
     return Bridge(Codex(), Worker(), OPENED, follow_name=True)
 
 
-def user(text, uuid="u-1", seq=1):
+@pytest.fixture(autouse=True)
+def state(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))  # where attached files are kept
+
+
+def user(text, uuid="u-1", seq=1, **fields):
     return Event.from_wire({"sequence_num": seq, "event_id": f"ev-{seq}", "source": "client", "payload": {
-        "type": "user", "uuid": uuid, "message": {"role": "user", "content": [{"type": "text", "text": text}]}}})
+        "type": "user", "uuid": uuid, "message": {"role": "user", "content": [{"type": "text", "text": text}]}, **fields}})
+
+
+def settle(bridge):
+    """Run what the bridge worked out off its loop, as the loop does next."""
+    source, task = bridge._inbox.get(timeout=5)
+    assert source == "task"
+    task()
 
 
 def control(subtype, seq=1, **fields):
@@ -129,7 +155,7 @@ def test_a_message_from_the_app_runs_a_codex_turn(bridge):
     assert said["message"]["content"] == [{"type": "text", "text": "One file: a"}]
     (ended,) = bridge.worker.calls("end_turn")
     assert ended[0] is message
-    assert ended[1] == {"result": "One file: a", "is_error": False, "duration_ms": 1200, "usage": {
+    assert ended[1] == {"result": "One file: a", "is_error": False, "duration_ms": 1200, "codex_turn": "turn-1", "usage": {
         "input_tokens": 50, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 0, "output_tokens": 7}}
     assert bridge.worker.calls("report_metadata")[-1] == ({"context_usage": {"used_tokens": 97, "max_tokens": 1000}},)
     assert bridge.turn is None
@@ -231,7 +257,7 @@ def test_an_approval_is_put_to_the_app_and_its_answer_returned(bridge):
     bridge._from_codex(approval())
     (prompt,) = bridge.worker.calls("prompt")
     assert prompt[:2] == ("Bash", {"command": "rm x"})
-    assert prompt[2] == {"tool_use_id": "exec-1", "description": "Run: rm x", "raw_command": "rm x"}
+    assert (prompt[2]["tool_use_id"], prompt[2]["description"], prompt[2]["raw_command"]) == ("exec-1", "Run: rm x", "rm x")
 
     bridge._from_controller(answer("prompt-1", behavior="allow"))
     assert bridge.codex.answers == [(7, {"decision": "accept"})]
@@ -288,6 +314,73 @@ def test_a_question_is_asked_and_answered_by_id(bridge):
     assert bridge.codex.answers == [(3, {"answers": {"q1": {"answers": ["Go"]}}})]
 
 
+def test_always_allow_lasts_for_the_session_and_covers_that_command(bridge):
+    bridge._from_controller(user("clean up"))
+    bridge._from_codex(approval())
+    rule = [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "rm x"}], "behavior": "allow", "destination": "session"}]
+    assert bridge.worker.calls("prompt")[0][2]["permission_suggestions"] == rule
+    bridge._from_controller(answer("prompt-1", behavior="allow", updatedPermissions=rule))
+    assert bridge.codex.answers == [(7, {"decision": "accept"})]
+
+    bridge._from_codex(approval(8))  # the same command again: not asked
+    assert bridge.codex.answers[-1] == (8, {"decision": "accept"}) and len(bridge.worker.calls("prompt")) == 1
+    bridge._from_codex(approval(9, command="bash -lc 'rm y'"))  # another is
+    assert len(bridge.worker.calls("prompt")) == 2
+    bridge._from_controller(answer("prompt-2", seq=10, behavior="allow"))  # "Allow once"
+    bridge._from_codex(approval(10, command="bash -lc 'rm y'"))
+    assert len(bridge.worker.calls("prompt")) == 3
+
+
+def test_always_allow_is_codexs_to_remember_where_it_offers_to(bridge):
+    bridge._from_controller(user("clean up"))
+    bridge._from_codex(approval(availableDecisions=["accept", "acceptForSession", "decline"]))
+    bridge._from_controller(answer("prompt-1", behavior="allow", updatedPermissions=[{"type": "addRules"}]))
+    assert bridge.codex.answers == [(7, {"decision": "acceptForSession"})] and bridge.allowed == set()
+
+
+def elicitation(request_id=5, **params):
+    return {"method": "mcpServer/elicitation/request", "id": request_id, "params": {
+        "threadId": THREAD, "turnId": "turn-1", "serverName": "tracker", "_meta": None, **params}}
+
+
+def test_an_mcp_tool_asking_to_run_is_a_permission_card(bridge):
+    bridge._from_controller(user("file it"))
+    ask = elicitation(mode="form", message="Allow tracker to create an issue?", requestedSchema={"type": "object", "properties": {}},
+                      _meta={"persist": ["session", "always"], "tool_params": {"title": "Bug"}})
+    bridge._from_codex(ask)
+    tool, shown, options = bridge.worker.calls("prompt")[0]
+    assert (tool, shown, options["description"]) == ("mcp__tracker", {"title": "Bug"}, "Allow tracker to create an issue?")
+    assert options["tool_use_id"] == "request-5" and options["permission_suggestions"] is None
+    bridge._from_controller(answer("prompt-1", behavior="allow"))
+    bridge._from_codex({**ask, "id": 6})
+    bridge._from_controller(answer("prompt-2", seq=10, behavior="deny"))
+    assert bridge.codex.answers == [
+        (5, {"action": "accept", "content": {}, "_meta": None}),
+        (6, {"action": "decline", "content": None, "_meta": None})]
+
+
+def test_an_mcp_form_of_choices_is_asked_as_questions(bridge):
+    bridge._from_controller(user("file it"))
+    schema = {"type": "object", "required": ["kind"], "properties": {
+        "kind": {"type": "string", "title": "Kind", "enum": ["bug", "task"]},
+        "urgent": {"type": "boolean", "description": "Is it urgent?"}}}
+    bridge._from_codex(elicitation(mode="form", message="About the issue", requestedSchema=schema))
+    tool, asked, _ = bridge.worker.calls("prompt")[0]
+    assert tool == "AskUserQuestion"
+    assert [(q["question"], [o["label"] for o in q["options"]]) for q in asked["questions"]] == [
+        ("Kind", ["bug", "task"]), ("Is it urgent?", ["Yes", "No"])]
+    bridge._from_controller(answer("prompt-1", behavior="allow", updatedInput={"answers": {"Kind": "task", "Is it urgent?": "No"}}))
+    assert bridge.codex.answers == [(5, {"action": "accept", "content": {"kind": "task", "urgent": False}, "_meta": None})]
+
+
+def test_an_mcp_form_the_app_cannot_carry_is_left_to_the_tui(bridge):
+    bridge._from_controller(user("file it"))
+    schema = {"type": "object", "properties": {"title": {"type": "string"}}}  # free text
+    bridge._from_codex(elicitation(mode="form", message="Title?", requestedSchema=schema))
+    assert bridge.worker.calls("prompt") == [] and bridge.codex.answers == []
+    assert "Answer it in the Codex TUI" in bridge.worker.events()[-1]["message"]["content"][0]["text"]
+
+
 # -- settings ---------------------------------------------------------------------------
 def test_the_apps_mode_menu_changes_the_threads_settings(bridge):
     request = control("set_permission_mode", mode="acceptEdits")
@@ -303,8 +396,9 @@ def test_the_apps_mode_menu_changes_the_threads_settings(bridge):
     assert bridge.mode == "acceptEdits"
     init = bridge.worker.events()[-1]
     assert (init["subtype"], init["permissionMode"], init["model"], init["effort"]) == ("init", "acceptEdits", "gpt-x", "low")
-    assert bridge.worker.calls("report_metadata")[-1] == (
-        {"model": "gpt-x", "effort_level": "low", "permission_mode": "acceptEdits"},)
+    reported = bridge.worker.calls("report_metadata")[-1][0]
+    assert (reported["model"], reported["effort_level"], reported["permission_mode"]) == ("gpt-x", "low", "acceptEdits")
+    assert reported["container_cc_version"]  # the app asks for a diff only of a worker whose version it knows
 
 
 def test_settings_that_did_not_move_are_not_announced_again(bridge):
@@ -332,15 +426,113 @@ def test_model_and_effort_follow_the_apps_controls(bridge):
 
 def test_every_control_request_gets_an_answer(bridge):
     bridge._from_controller(control("get_context_usage"))
-    bridge._from_controller(control("get_workspace_diff", seq=2))
     bridge._from_controller(control("mcp_set_servers", seq=3, servers={}))
+    bridge._from_controller(control("list_directory", seq=4, path=""))
     bridge.codex.refuse.add("thread/name/set")
-    bridge._from_controller(control("rename_session", seq=4, title="new"))
-    assert [call[1]["totalTokens"] if "totalTokens" in call[1] else call[1] for call in bridge.worker.calls("respond")] == [
-        0, {"diff": None}]
-    assert [call[1] for call in bridge.worker.calls("reject")] == [
-        "codex-rc does not handle control_request subtype: mcp_set_servers",
-        "Codex refused: thread/name/set: no"]
+    bridge._from_controller(control("rename_session", seq=5, title="new"))
+    bridge._from_controller(control("fork_conversation", seq=6))
+    bridge._from_controller(control("end_session", seq=7, reason="archived"))
+    assert [call[1] for call in bridge.worker.calls("respond")][1:] == [
+        {"forked": False, "reason": "requires_remote_control_server"}, {}]
+    assert bridge.worker.calls("respond")[0][1]["totalTokens"] == 0
+    assert [call[1:] for call in bridge.worker.calls("reject")] == [
+        ("A Codex session takes its MCP servers from Codex's own configuration.", {"error_code": "unsupported_request"}),
+        ("codex-rc does not handle control_request subtype: list_directory", {"error_code": "unsupported_request"}),
+        ("Codex refused: thread/name/set: no", {})]
+
+
+def test_a_claude_model_picked_in_the_app_is_explained_once(bridge):
+    bridge._from_controller(control("set_model", model="claude-opus-5-5"))
+    bridge._from_controller(control("set_model", seq=2, model="claude-opus-5-5"))
+    assert len(bridge.worker.calls("reject")) == 2
+    said, done = bridge.worker.events()
+    assert "Codex's models: `gpt-x`, `gpt-y`. Switch with `/model <id>`" in said["message"]["content"][0]["text"]
+    assert (done["type"], done["num_turns"]) == ("result", 0)
+
+
+def test_an_effort_the_model_lacks_is_refused(bridge):
+    bridge._from_controller(control("apply_flag_settings", settings={"effortLevel": "max"}))
+    assert bridge.worker.calls("reject")[0][1] == "`gpt-x` has no effort 'max'. It takes: low, high"
+    assert bridge.codex.sent("thread/settings/update") == []
+
+
+# -- the app's panels: changes, files, side chat --------------------------------------------
+def test_the_changes_panel_gets_the_working_trees_diff(bridge, monkeypatch):
+    monkeypatch.setattr(workspace, "diff", lambda cwd: {"stats": {"filesCount": 1}, "cwd": cwd})
+    request = control("get_workspace_diff")
+    bridge._from_controller(request)
+    assert bridge.worker.calls("respond") == []  # worked out off the loop
+    settle(bridge)
+    assert bridge.worker.calls("respond") == [(request, {"diff": {"stats": {"filesCount": 1}, "cwd": "/w"}}, {})]
+
+
+def test_a_file_mention_searches_and_a_folder_lists(bridge, tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("")
+    bridge.settings["cwd"] = str(tmp_path)
+    bridge.codex.results["fuzzyFileSearch"] = {"files": [{"path": "src/a.py"}, {"path": ".git/HEAD"}]}
+    for seq, query in enumerate(["", "src/", "a.p"], 1):
+        bridge._from_controller(control("file_suggestions", seq=seq, query=query))
+        settle(bridge)
+    assert [call[1]["suggestions"] for call in bridge.worker.calls("respond")] == [
+        [{"path": "src/"}], [{"path": "src/"}, {"path": "src/a.py"}], [{"path": "src/a.py"}]]
+    assert bridge.codex.sent("fuzzyFileSearch") == [{"query": "a.p", "roots": [str(tmp_path)], "cancellationToken": None}]
+
+
+def test_the_file_viewer_reads_only_the_workspace(bridge, tmp_path):
+    (tmp_path / "a.txt").write_text("hi\n")
+    bridge.settings["cwd"] = str(tmp_path)
+    bridge._from_controller(control("read_file", path="a.txt"))
+    bridge._from_controller(control("read_file", seq=2, path="/etc/passwd"))
+    assert bridge.worker.calls("respond")[0][1] == {"absPath": "a.txt", "contents": "hi\n", "lossy": False}
+    assert bridge.worker.calls("reject")[0][1] == "read denied: /etc/passwd"
+
+
+def test_a_side_question_is_sampled_from_the_thread(bridge):
+    nothing_yet = control("side_question", question="where?")
+    bridge._from_controller(nothing_yet)
+    assert bridge.worker.calls("respond") == [(nothing_yet, {"response": None, "synthetic": False}, {})]
+
+    bridge.last_turn = "turn-0"
+    bridge.codex.results["thread/sample"] = {"text": "/w"}
+    asked = control("side_question", seq=2, question="where?", history=[{"question": "who?", "response": "you"}])
+    bridge._from_controller(asked)
+    settle(bridge)
+    (sample,) = bridge.codex.sent("thread/sample")
+    assert (sample["expectedTurnId"], sample["allowInProgressTurn"], sample["disableMcp"]) == ("turn-0", True, True)
+    assert sample["prompt"].endswith("Q: who?\nA: you\n\nQ: where?")
+    assert bridge.worker.calls("respond")[-1] == (asked, {"response": "/w", "synthetic": False}, {})
+    assert bridge.codex.sent("turn/start") == []  # beside the conversation: no turn
+
+
+def test_a_side_question_codex_cannot_answer_is_refused(bridge):
+    bridge.last_turn = "turn-0"
+    bridge.codex.refuse.add("thread/sample")
+    bridge._from_controller(control("side_question", question="where?"))
+    settle(bridge)
+    assert bridge.worker.calls("reject")[0][1] == "thread/sample: no"
+
+
+def test_a_queued_message_can_be_withdrawn(bridge):
+    first, second = user("one"), user("two", uuid="u-2", seq=2)
+    bridge._from_controller(first)
+    bridge.codex.refuse.add("turn/steer")
+    bridge._from_controller(second)  # waits for the turn to end
+    bridge._from_controller(control("cancel_async_message", seq=3, message_uuid="u-2"))
+    bridge._from_controller(control("cancel_async_message", seq=4, message_uuid="u-2"))
+    assert [call[1] for call in bridge.worker.calls("respond")] == [{"cancelled": True}, {"cancelled": False}]
+    bridge._from_codex(turn_done())
+    assert len(bridge.codex.sent("turn/start")) == 1
+
+
+def test_codexs_mcp_servers_show_in_the_apps_status(bridge):
+    bridge.codex.results["mcpServerStatus/list"] = {"data": [
+        {"name": "docs", "runtimeStatus": "connected"}, {"name": "tracker", "runtimeStatus": "authenticationRequired"}]}
+    bridge._from_codex({"method": "mcpServer/startupStatus/updated", "params": {"name": "docs"}})
+    servers = [{"name": "docs", "status": "connected"}, {"name": "tracker", "status": "needs-auth"}]
+    assert bridge.worker.events()[-1]["mcp_servers"] == servers
+    bridge._from_controller(control("mcp_status"))
+    assert bridge.worker.calls("respond")[-1][1] == {"mcpServers": servers}
 
 
 # -- commands answered here -------------------------------------------------------------
@@ -348,15 +540,106 @@ def test_slash_commands_are_answered_without_a_turn(bridge):
     bridge._from_controller(user("/model"))
     bridge._from_controller(user("/model gpt-y", seq=2))
     bridge._from_controller(user("/effort ludicrous", seq=3))
-    bridge._from_controller(user("/modelling is fun", seq=4))  # not a command: goes to Codex
+    bridge._from_controller(user("/sandbox", seq=4))
     said = [event["message"]["content"][0]["text"] for event in bridge.worker.events()]
     assert said[0] == "Model: `gpt-x`. Codex has: `gpt-x`, `gpt-y`."
     assert said[1] == "Model set to `gpt-y`, from the next turn."
     assert said[2] == "`gpt-x` has no effort `ludicrous`. It takes: low, high."
+    assert said[3] == "Sandbox: read-only, network off. Approvals: asks you when it needs more."
     assert bridge.codex.sent("thread/settings/update") == [{"threadId": THREAD, "model": "gpt-y"}]
     assert [call[-1] for call in bridge.worker.calls("end_turn")] == [
         {"result": text, "num_turns": 0} for text in said]
-    assert len(bridge.codex.sent("turn/start")) == 1
+    assert bridge.codex.sent("turn/start") == []
+
+
+def test_a_command_this_session_lacks_never_reaches_the_model(bridge):
+    """The app passes on the commands it doesn't run itself, as text."""
+    bridge._from_controller(user("/clear"))
+    bridge._from_controller(user("/Frobnicate now", seq=2))
+    said = [event["message"]["content"][0]["text"] for event in bridge.worker.events()]
+    assert said[0].startswith("`/clear` isn't available on a Codex session. This one takes `/codex`, `/compact`")
+    assert said[1].startswith("`/frobnicate` isn't available")
+    assert bridge.codex.sent("turn/start") == []
+    bridge._from_controller(user("/tmp is full, what can go?", seq=3))  # a path, not a command
+    bridge._from_controller(user("/tmp/x.log\nis huge", uuid="u-2", seq=4))
+    assert len(bridge.codex.sent("turn/start")) + len(bridge.codex.sent("turn/steer")) == 2
+
+
+def test_the_codex_command_reports_what_the_apps_cards_leave_out(bridge):
+    bridge.codex.results["account/rateLimits/read"] = {"rateLimits": {
+        "primary": {"usedPercent": 23.4, "windowDurationMins": 300, "resetsAt": None}, "secondary": None, "planType": "plus"}}
+    bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 1500}, "modelContextWindow": 3000}))
+    bridge._from_controller(user("/codex"))
+    assert bridge.worker.events()[0]["message"]["content"][0]["text"].splitlines() == [
+        "**Codex 0.170.0**",
+        "- Thread: `thr-1` in `/w`",
+        "- Model: `gpt-x`, effort `low`",
+        "- Sandbox: read-only, network off. Approvals: asks you when it needs more.",
+        "- Context: 1.5k of 3.0k tokens (50%)",
+        "- Usage: 23% of the 5-hour limit used",
+        "- Plan: plus",
+        "- Models, for `/model <id>`: `gpt-x`, `gpt-y`",
+        "- In a terminal: `codex resume thr-1`"]
+
+
+def test_compact_is_a_turn_of_the_command_that_asked(bridge):
+    command = user("/compact")
+    bridge._from_controller(command)
+    assert bridge.worker.events()[0]["message"]["content"][0]["text"] == "Nothing to compact yet."
+
+    bridge.last_turn = "turn-0"
+    again = user("/compact", uuid="u-2", seq=2)
+    bridge._from_controller(again)
+    assert bridge.codex.sent("thread/compact/start") == [{"threadId": THREAD}]
+    assert bridge.worker.calls("begin_turn") == [(again, {})]
+    bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 900}}))
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
+    bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
+    bridge._from_codex(item("completed", type="contextCompaction", id="c-1"))
+    bridge._from_codex(turn_done())
+    assert bridge.worker.events()[1:] == [
+        {"type": "system", "subtype": "status", "status": "compacting"},
+        {"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual", "pre_tokens": 900}},
+        {"type": "system", "subtype": "status", "status": None}]
+    ended = bridge.worker.calls("end_turn")[-1]
+    assert ended[0] is again and (ended[-1]["result"], ended[-1]["codex_turn"]) == ("Context compacted.", "turn-1")
+
+
+def test_a_compaction_of_codexs_own_is_marked_too(bridge):
+    bridge._from_controller(user("go on"))
+    bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
+    bridge._from_codex(item("completed", type="contextCompaction", id="c-1"))
+    assert bridge.worker.events()[1]["compact_metadata"] == {"trigger": "auto"}
+
+
+def test_review_runs_codexs_review_and_writes_its_findings_once(bridge):
+    command = user("/review")
+    bridge._from_controller(command)
+    assert bridge.codex.sent("review/start") == [
+        {"threadId": THREAD, "target": {"type": "uncommittedChanges"}, "delivery": "inline"}]
+    assert bridge.turn == "turn-1"
+    bridge._from_codex(item("completed", type="enteredReviewMode", id="r-1", review="current changes"))
+    bridge._from_codex(item("completed", type="userMessage", id="i-1", clientId=None, content=[{"type": "text", "text": "Review the changes"}]))
+    bridge._from_codex(item("completed", type="exitedReviewMode", id="r-2", review="One finding."))
+    bridge._from_codex(item("completed", type="agentMessage", id="msg_1", text="One finding."))  # the same, as a message
+    bridge._from_codex(turn_done())
+    assert [event["message"]["content"][0]["text"] for event in bridge.worker.events()] == [
+        "Reviewing current changes.", "One finding."]
+    assert bridge.worker.calls("end_turn")[0][0] is command
+
+    bridge._from_controller(user("/review only the tests", uuid="u-2", seq=2))
+    assert bridge.codex.sent("review/start")[-1]["target"] == {"type": "custom", "instructions": "only the tests"}
+    bridge._from_codex(item("completed", type="exitedReviewMode", id="r-3", review="Nothing to fix."))
+    bridge._from_codex(turn_done())  # no message repeated it: written as the turn ends
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "Nothing to fix."
+    assert bridge.worker.calls("end_turn")[-1][-1]["result"] == "Nothing to fix."
+
+
+def test_a_turn_command_waits_for_the_running_turn(bridge):
+    bridge._from_controller(user("work"))
+    bridge._from_controller(user("/review", uuid="u-2", seq=2))
+    assert bridge.codex.sent("review/start") == []
+    assert "in the middle of a turn" in bridge.worker.events()[0]["message"]["content"][0]["text"]
 
 
 def test_a_command_mid_turn_leaves_the_turn_running(bridge):
@@ -389,6 +672,30 @@ def test_a_reply_is_streamed_to_watchers_then_kept_once(bridge):
     # The stored message goes out between the block's end and the message's.
     order = [entry[0] for entry in bridge.worker.log if entry[0] in ("event", "ephemeral")]
     assert order == ["ephemeral"] * 5 + ["event"] + ["ephemeral"] * 2
+
+
+def test_a_thought_is_streamed_as_thinking(bridge):
+    bridge._from_controller(user("think"))
+    for index, text in enumerate(["First.", "Then."]):
+        bridge._from_codex(note("item/reasoning/summaryPartAdded", turnId="turn-1", itemId="rs_1", summaryIndex=index))
+        bridge._from_codex(note("item/reasoning/summaryTextDelta", turnId="turn-1", itemId="rs_1", summaryIndex=index, delta=text))
+    bridge._from_codex(item("completed", type="reasoning", id="rs_1", summary=["First.", "Then."], content=[]))
+    live = [event["event"] for event in bridge.worker.events("ephemeral")]
+    assert live[1]["content_block"] == {"type": "thinking", "thinking": ""}
+    assert "".join(e["delta"]["thinking"] for e in live if e["type"] == "content_block_delta") == "First.\n\nThen."
+    (kept,) = bridge.worker.events()
+    assert kept["message"]["id"] == "rs_1" == live[0]["message"]["id"]
+    assert kept["message"]["content"][0]["thinking"] == "First.\n\nThen."
+
+
+def test_a_message_that_never_finished_is_closed_when_the_next_begins(bridge):
+    bridge._from_controller(user("say hi"))
+    bridge._from_codex(delta("Hel"))
+    bridge._from_codex(note("item/agentMessage/delta", turnId="turn-1", itemId="msg_2", delta="Again"))
+    kinds = [event["event"]["type"] for event in bridge.worker.events("ephemeral")]
+    assert kinds == ["message_start", "content_block_start", "content_block_delta",
+                     "content_block_stop", "message_delta", "message_stop"]
+    assert (bridge.stream, bridge.stream_text) == ("msg_2", "Again")  # held for the next flush
 
 
 def test_nothing_is_streamed_when_nobody_is_watching(bridge):
@@ -437,19 +744,75 @@ def test_stopping_mid_turn_closes_what_the_app_shows_as_open(bridge):
     assert bridge.worker.calls("end_turn")[-1][-1]["result"] == closed["content"]
 
 
-def test_backfill_writes_earlier_turns_oldest_first(bridge):
-    def turn(n, status="completed"):
-        return {"id": f"t{n}", "status": status, "durationMs": 5, "items": [
-            {"type": "userMessage", "id": f"u{n}", "clientId": None, "content": [{"type": "text", "text": f"q{n}"}]},
-            {"type": "agentMessage", "id": f"msg_{n}", "text": f"a{n}"}]}
+def turn(n, status="completed"):
+    return {"id": f"t{n}", "status": status, "durationMs": 5, "items": [
+        {"type": "userMessage", "id": f"u{n}", "clientId": None, "content": [{"type": "text", "text": f"q{n}"}]},
+        {"type": "agentMessage", "id": f"msg_{n}", "text": f"a{n}"}]}
 
-    bridge.codex.results["thread/turns/list"] = {"data": [turn(3, "inProgress"), turn(2), turn(1)]}  # newest first
-    bridge.backfill()
+
+def result(turn_id=None, **fields):
+    return Event.from_wire({"sequence_num": 1, "event_id": "ev", "source": "worker", "payload": {
+        "type": "result", "num_turns": 1, **({"codex_turn": turn_id} if turn_id else {}), **fields}})
+
+
+def test_a_new_session_is_given_the_threads_latest_turns(bridge):
+    bridge.codex.results["thread/turns/list"] = {"data": [turn(2), turn(1)]}  # newest first
+    bridge.backfill(new=True)
     assert bridge.codex.sent("thread/turns/list") == [
         {"threadId": THREAD, "limit": 30, "sortDirection": "desc", "itemsView": "full"}]
     written = bridge.worker.events()
     assert [event["type"] for event in written] == ["user", "assistant", "result"] * 2
     assert [event["message"]["content"] for event in written if event["type"] == "user"] == ["q1", "q2"]
+    assert [event["codex_turn"] for event in written if event["type"] == "result"] == ["t1", "t2"]
+
+
+def test_a_session_served_before_catches_up_on_the_turns_since(bridge):
+    """What was done in a terminal while the thread was off Remote Control."""
+    bridge.codex.results["thread/turns/list"] = {"data": [turn(3), turn(2), turn(1)]}
+    bridge.worker.held = [result(None, num_turns=0), result("t1")]  # a command's answer, then the last turn written
+    bridge.backfill(new=False)
+    assert [event["codex_turn"] for event in bridge.worker.events() if event["type"] == "result"] == ["t2", "t3"]
+
+
+def test_a_transcript_that_does_not_name_its_turns_is_left_alone(bridge):
+    bridge.codex.results["thread/turns/list"] = {"data": [turn(1)]}
+    bridge.worker.held = [result(None)]  # written by a bridge from before turns were named
+    bridge.backfill(new=False)
+    assert bridge.worker.log == []
+    bridge.worker.held = []  # a session that never saw a turn holds none of them
+    bridge.backfill(new=False)
+    assert [event["type"] for event in bridge.worker.events()] == ["user", "assistant", "result"]
+
+
+def test_a_turn_running_as_the_bridge_attaches_is_written_as_far_as_it_got(bridge):
+    running = {"id": "t2", "status": "inProgress", "items": [
+        {"type": "userMessage", "id": "u2", "clientId": None, "content": [{"type": "text", "text": "q2"}]},
+        {**COMMAND, "id": "exec-0", "status": "completed", "aggregatedOutput": "a", "exitCode": 0},
+        COMMAND,  # still running
+        {"type": "agentMessage", "id": "msg_2", "text": "Loo"}]}  # may still be being written
+    bridge.codex.results["thread/turns/list"] = {"data": [running]}
+    bridge.backfill(new=True)
+    typed, _, output, open_call = bridge.worker.events()
+    assert typed["message"]["content"] == "q2" and output["message"]["content"][0]["content"] == "a"
+    assert open_call["message"]["content"][0]["id"] == "exec-1"
+
+    # What Codex still reports of the items written is dropped; the open call's end closes it.
+    bridge._from_codex(item("started", **COMMAND))
+    bridge._from_codex(item("completed", **{**COMMAND, "id": "exec-0", "status": "completed"}))
+    assert len(bridge.worker.events()) == 4
+    bridge._from_codex(item("completed", **{**COMMAND, "status": "completed", "aggregatedOutput": "b", "exitCode": 0}))
+    bridge._from_codex(item("completed", type="agentMessage", id="msg_2", text="Look: b"))
+    closed, said = bridge.worker.events()[4:]
+    assert closed["message"]["content"][0] == {"type": "tool_result", "tool_use_id": "exec-1", "content": "b", "is_error": False}
+    assert said["message"]["content"][0]["text"] == "Look: b"
+
+
+def test_a_thread_nobody_has_written_to_has_no_history(bridge):
+    bridge.codex.request = lambda method, params=None, **_: (_ for _ in ()).throw(
+        AppServerError(method, {"message": "thread thr-1 is not materialized yet"}))
+    bridge.backfill(new=True)
+    bridge._adopt_running_turn()
+    assert bridge.worker.log == [] and bridge.turn is None
 
 
 def test_a_turn_written_from_history_is_not_written_again(bridge):
@@ -457,10 +820,36 @@ def test_a_turn_written_from_history_is_not_written_again(bridge):
     and in the notifications it reads next."""
     done = {"id": "turn-1", "status": "completed", "durationMs": 5, "items": [{**COMMAND, "status": "completed", "aggregatedOutput": "a.txt"}]}
     bridge.codex.results["thread/turns/list"] = {"data": [done]}
-    bridge.backfill()
+    bridge.backfill(new=True)
     written = len(bridge.worker.log)
     bridge._from_codex(item("completed", **done["items"][0]))
     bridge._from_codex(turn_done())
     assert len(bridge.worker.log) == written
     bridge._from_codex(note("turn/started", turn={"id": "turn-2"}))  # the next turn is passed on as ever
     assert bridge.turn == "turn-2"
+
+
+# -- files attached in the app ---------------------------------------------------------------
+def test_an_attached_file_is_fetched_for_codex(bridge, tmp_path):
+    bridge.worker.files = {"11112222-aaaa": b"notes", "33334444-bbbb": b"png"}
+    bridge._from_controller(user("read these", file_attachments=[
+        {"file_uuid": "11112222-aaaa", "file_name": "../notes.txt", "is_image": False},
+        {"file_uuid": "33334444-bbbb", "file_name": "shot.png", "is_image": True},
+        {"file_uuid": "gone", "file_name": "lost.pdf", "is_image": False}]))
+    uploads = tmp_path / "codex-remote-control" / "uploads" / THREAD
+    assert (uploads / "11112222-notes.txt").read_bytes() == b"notes"
+    assert bridge.codex.sent("turn/start")[0]["input"] == [
+        {"type": "text", "text": "read these", "text_elements": []},
+        {"type": "localImage", "path": str(uploads / "33334444-shot.png")},
+        {"type": "text", "text_elements": [], "text": (
+            f"[Attached file: {uploads / '11112222-notes.txt'}]\n[An attached file, lost.pdf, could not be fetched]")}]
+
+
+# -- what Codex says beside a turn -------------------------------------------------------------
+def test_a_warning_about_the_thread_is_said_in_the_transcript(bridge):
+    bridge._from_controller(user("go"))
+    bridge._from_codex(note("warning", message="You have 5% of your weekly limit left."))
+    bridge._from_codex(note("model/rerouted", turnId="turn-1", fromModel="gpt-x", toModel="gpt-y", reason="capacity"))
+    bridge._from_codex({"method": "warning", "params": {"threadId": None, "message": "not about this thread"}})
+    assert [event["message"]["content"][0]["text"] for event in bridge.worker.events()] == [
+        "You have 5% of your weekly limit left.", "Codex is running this turn on `gpt-y` instead of `gpt-x`."]

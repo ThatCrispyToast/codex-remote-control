@@ -7,11 +7,19 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
 
-from claude_rc import RemoteControlClient, RemoteControlWorker, WorkerEvicted
+import httpx
+from claude_rc import (
+    APIError,
+    CredentialsError,
+    RemoteControlClient,
+    RemoteControlWorker,
+    WorkerEvicted,
+)
 
-from . import __version__, background
+from . import __version__, background, workspace
 from .appserver import AppServer, AppServerClosed, AppServerError
 from .bridge import TITLE_PREFIX, Bridge, ThreadClosed, session_title
 
@@ -59,11 +67,56 @@ def open_session(rc: RemoteControlClient, thread: dict, name: str | None) -> tup
             rc.rename_session(session["id"], title)
         return session["id"], title, False, not named
     title = name or after_thread
-    return rc.create_session(title, cwd=thread["cwd"], tags=[tag])["id"], title, True, name is None
+    repository, branch = workspace.repository(thread["cwd"]) or (None, None)
+    session = rc.create_session(title, cwd=thread["cwd"], tags=[tag], repository=repository, branch=branch)
+    return session["id"], title, True, name is None
 
 
 def session_url(session_id: str) -> str:
     return f"https://claude.ai/code/{session_id.replace('cse_', 'session_', 1)}"
+
+
+def explain(error: Exception) -> str:
+    """What stopped the bridge, in a line its user can act on: the command is
+    typed at a Codex prompt, where a traceback helps nobody."""
+    if isinstance(error, CredentialsError):
+        return f"Claude Code is not signed in on this machine. Run `claude`, sign in with /login, then try again. ({error})"
+    if isinstance(error, FileNotFoundError) and error.filename == "codex":
+        return "The codex command was not found. Install the Codex CLI, or put it on PATH."
+    if isinstance(error, subprocess.CalledProcessError):
+        said = (error.stderr or "").strip().splitlines()
+        return f"Codex could not start its app-server: {said[-1] if said else error}. codex-rc needs Codex 0.170 or later."
+    if isinstance(error, (ValueError, KeyError)):
+        return "Codex's app-server gave an answer codex-rc could not read. codex-rc needs Codex 0.170 or later."
+    if isinstance(error, APIError):
+        return f"claude.ai refused ({error.status}): {str(error.body)[:300]}"
+    if isinstance(error, httpx.HTTPError):
+        return f"Could not reach claude.ai: {error or type(error).__name__}"
+    return f"Could not reach Codex's app-server: {error}"
+
+
+def list_bridges() -> int:
+    """Print the threads on Remote Control from this machine."""
+    serving = background.bridges()
+    if not serving:
+        print("nothing is on Remote Control")
+    for thread_id, bridge in serving.items():
+        where = f"  {bridge['cwd']}" if bridge.get("cwd") else ""
+        print(f'{thread_id}  {bridge.get("session", "starting")}  "{bridge.get("title", "")}"{where}')
+    return 0
+
+
+def stop_bridge(thread_id: str | None, parser: argparse.ArgumentParser) -> int:
+    """Take a thread off Remote Control: the one named, else the only one on it."""
+    if thread_id is None:
+        serving = background.bridges()
+        if len(serving) > 1:
+            list_bridges()
+            parser.error("more than one thread is on Remote Control: name one with --thread ID")
+        thread_id = next(iter(serving), None)
+    stopped = thread_id is not None and background.stop(thread_id)
+    print("off Remote Control" if stopped else "that thread is not on Remote Control" if thread_id else "nothing is on Remote Control")
+    return 0
 
 
 def serve_from_background(thread_id: str, args: argparse.Namespace) -> int:
@@ -89,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         "session from the background; anywhere else it runs until interrupted.",
     )
     parser.add_argument("name", nargs="*", help='the session\'s name in claude.ai (default: "Codex: " and the thread\'s name, or its directory)')
-    parser.add_argument("--stop", action="store_true", help="take the thread off Remote Control")
+    parser.add_argument("--stop", action="store_true", help="take the thread off Remote Control (outside a Codex session: the only one on it, or the one --thread names)")
+    parser.add_argument("--list", action="store_true", help="list the threads on Remote Control from this machine")
     parser.add_argument("--thread", metavar="ID", help="the thread to serve, by the id `codex resume` takes (default: the session this is typed in, else a new thread)")
     parser.add_argument("--last", action="store_true", help="serve the directory's most recent thread")
     parser.add_argument("-C", "--cd", metavar="DIR", default=os.getcwd(), help="the directory a new thread works in (default: here)")
@@ -105,12 +159,10 @@ def main(argv: list[str] | None = None) -> int:
     # Codex sets this for what a session runs, which is how `!codex-rc` knows its thread.
     here = os.environ.get("CODEX_THREAD_ID")
     args.thread = args.thread or (None if args.last else here)
+    if args.list:
+        return list_bridges()
     if args.stop:
-        if not args.thread:
-            parser.error("outside a Codex session, --stop needs --thread ID")
-        stopped = background.stop(args.thread)
-        print("off Remote Control" if stopped else "that thread is not on Remote Control")
-        return 0
+        return stop_bridge(args.thread, parser)
     if here and args.thread:
         return serve_from_background(args.thread, args)
     args.cd = os.path.abspath(args.cd)
@@ -127,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         opened = open_thread(codex, args)
     except AppServerError as e:
         sys.exit(f"Codex refused: {e}" + (_NOT_SHARED if "active writer" in str(e) else ""))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError) as e:
+        sys.exit(explain(e))
     thread = opened["thread"]
     record = background.claim(thread["id"])
     if record is None:
@@ -137,25 +191,28 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rc = RemoteControlClient()
         session_id, title, new_session, follow_name = open_session(rc, thread, args.name)
-        record.update(session=session_url(session_id), title=title)
+        record.update(session=session_url(session_id), title=title, cwd=opened["cwd"])
         print(f"thread   {thread['id']}  ({opened['cwd']})")
         print(f"session  {session_url(session_id)}  ({title})")
         print(f"tui      codex resume {thread['id']}", flush=True)
         with RemoteControlWorker(rc, session_id) as worker:
             bridge = Bridge(codex, worker, opened, follow_name=follow_name)
-            if new_session:
-                bridge.backfill()
+            bridge.backfill(new=new_session)
             bridge.run()
     except KeyboardInterrupt:
         return 0
     except ThreadClosed:
         print("the Codex thread was closed", file=sys.stderr)
+        background.drop_uploads(thread["id"])
         return 0
     except WorkerEvicted as e:
         print(f"the session was taken away: {e}", file=sys.stderr)
         return 0 if e.reason == "session_not_active" else 1
     except AppServerClosed as e:
         print(f"lost Codex: {e}", file=sys.stderr)
+        return 1
+    except (CredentialsError, APIError, httpx.HTTPError) as e:
+        print(explain(e), file=sys.stderr)
         return 1
     finally:
         record.close()

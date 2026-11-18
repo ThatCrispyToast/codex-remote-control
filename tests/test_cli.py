@@ -30,8 +30,17 @@ def test_a_thread_never_served_gets_a_session_titled_after_it():
     assert cli.open_session(account, THREAD, None) == ("cse_new", "Codex: project", True, True)
     assert account.calls == [
         ("sessions", {"tags": "codex-thread:thr-1", "statuses": "active"}),
-        ("create", "Codex: project", {"cwd": "/home/me/project", "tags": ["codex-thread:thr-1"]}),
+        ("create", "Codex: project", {
+            "cwd": "/home/me/project", "tags": ["codex-thread:thr-1"], "repository": None, "branch": None}),
     ]
+
+
+def test_a_session_is_told_the_repository_its_thread_works_in(monkeypatch):
+    """Without one the app keeps its Changes panel shut."""
+    monkeypatch.setattr(cli.workspace, "repository", lambda cwd: ("me/project", "main"))
+    account = Account()
+    cli.open_session(account, THREAD, None)
+    assert account.calls[-1][2]["repository"] == "me/project" and account.calls[-1][2]["branch"] == "main"
 
 
 def test_a_name_given_is_the_title_and_stops_following_the_thread():
@@ -60,3 +69,16 @@ def test_a_thread_id_given_as_a_name_is_caught(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         cli.main(["01234567-89ab-7cde-8f01-23456789abcd"])
     assert "use --thread 01234567-89ab-7cde-8f01-23456789abcd" in capsys.readouterr().err
+
+
+def test_what_stops_the_bridge_is_said_in_a_line():
+    from claude_rc import APIError, CredentialsError
+
+    assert "sign in with /login" in cli.explain(CredentialsError("no credentials"))
+    assert cli.explain(FileNotFoundError(2, "No such file", "codex")).startswith("The codex command was not found")
+    refused = cli.explain(cli.subprocess.CalledProcessError(2, ["codex"], stderr="error: unrecognized subcommand 'daemon'\n"))
+    assert "unrecognized subcommand 'daemon'" in refused and "0.170 or later" in refused
+    assert cli.explain(APIError(403, '{"error": "nope"}', None)) == 'claude.ai refused (403): {"error": "nope"}'
+    assert cli.explain(cli.httpx.ConnectError("no route")) == "Could not reach claude.ai: no route"
+    assert cli.explain(ConnectionRefusedError("refused")) == "Could not reach Codex's app-server: refused"
+    assert "could not read" in cli.explain(ValueError("not JSON"))

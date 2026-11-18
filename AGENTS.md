@@ -36,6 +36,22 @@ what neither the README nor the code will tell you.
   answers "already has an active writer". `-m` alone keeps it on the daemon.
 - `thread/settings/update` does not validate a model id, so the bridge checks
   one against `model/list` itself.
+- A thread nobody has written to yet is "not materialized": `thread/turns/list`
+  refuses it. It has no turns, which is how the bridge reads that refusal.
+- An approval's `availableDecisions` for a command are `accept`, a rule
+  (`acceptWithExecpolicyAmendment`) and `cancel`. There is no
+  `acceptForSession` and no `decline`. The rule is one Codex keeps after the
+  session, so the bridge never sends it: "Always allow" is the bridge's own
+  memory of that exact command.
+- `review/start` reports a review's findings twice, as the `exitedReviewMode`
+  item and as an `agentMessage` with the same text, and gives the turn a
+  `userMessage` of Codex's own wording.
+- `thread/sample` answers a prompt from the thread's context without adding a
+  turn. It is what `/btw` runs on, and it spends quota like a turn.
+- `thread/compact/start` answers `{}` and the compaction then runs as a turn
+  of its own, with one `contextCompaction` item.
+- Nothing reports a thread's token usage until its next turn, so the context
+  meter reads empty on a bridge that has just attached.
 
 ## What claude.ai expects
 
@@ -43,8 +59,30 @@ what neither the README nor the code will tell you.
   if `get_context_usage` is answered with only some of Claude Code's keys.
   Refuse the request or send every key, as `translate.context_usage` does.
 - The app's model menu lists Claude models only, so a Codex session reads
-  "Unsupported model". `/model`, `/effort` and `/compact`, typed in the app's
-  message box, are the bridge's own commands.
+  "Unsupported model".
+- The app has its own `/` commands. It runs many itself (`/status`, `/usage`,
+  `/help`, `/config`), sends `/model <id>` as `set_model`, and passes others
+  on as the text of a user message (`/effort`, `/compact`, `/sandbox`). So a
+  message whose first word is a `/command` is never a prompt: the bridge runs
+  it or turns it away. Leaving one to the model spends a turn on nonsense.
+- The Changes panel needs two things of a session. It must have been created
+  with its GitHub repository (`create_session(repository=…)`), else the server
+  tags it `config:no-git-repo`. And the worker must report
+  `container_cc_version` in its metadata: the app asks for
+  `get_workspace_diff` only once it knows that version. A checkout with no
+  GitHub remote gets no Changes panel, as with Claude Code.
+- `@` mentions and the Files panel are `file_suggestions` (`""`, typed text,
+  or `"dir/"`) and `read_file`. `/btw` is `side_question`.
+- Attached files arrive as `file_attachments` on the user message, to be
+  fetched with the account's login (`download_file`).
+- "Always allow" shows on a card only for a `permission_suggestions` rule
+  with a `ruleContent`, which in practice means a command. The card says it
+  "lasts for this session", whatever the rule's `destination`.
+- `system/informational` is not drawn. A notice has to be an assistant
+  message to be seen.
+- Answers that take time (`get_workspace_diff`, `file_suggestions`,
+  `side_question`) are worked out off the bridge's loop and posted back to
+  it: the loop is the only thing that writes to the session.
 
 ## Where state lives
 
@@ -54,6 +92,12 @@ what neither the README nor the code will tell you.
 - Each running bridge holds a locked record in
   `~/.local/state/codex-remote-control/` (`$XDG_STATE_HOME`). The lock, not
   the pid in the record, is what says a bridge is alive.
+- Every `result` event the bridge writes for a Codex turn carries that turn's
+  id as `codex_turn`. A bridge taking a session up again reads the newest one
+  to know which turns the transcript lacks. A command's answer is a `result`
+  with `num_turns: 0` and no turn id.
+- Files attached in the app are saved under `uploads/<thread id>/` in the
+  state directory, and removed when the thread is closed.
 
 ## Testing against the real services
 
@@ -76,3 +120,11 @@ Codex plan and a real Claude account:
   that is already trusted.
 - Leave nothing running: stop the bridges a test started (`codex-rc --stop`)
   and check the state directory is empty.
+- `uv run` syncs the environment to the lockfile, so it cannot run against an
+  unpushed claude-rc-api. For that, `uv pip install -e <checkout>` and run
+  `.venv/bin/codex-rc` and `.venv/bin/python -m pytest` directly.
+- To see what the app sends, run the bridge with `-v` and drive the session
+  in a browser. As a controller, claude-rc-api's `request_control()` and
+  `send_message()` exercise most handlers without one.
+- A file-write approval in read-only mode usually comes as a command approval.
+  To get a `fileChange` one, ask Codex to use its `apply_patch` tool.

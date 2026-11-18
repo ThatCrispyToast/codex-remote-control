@@ -97,7 +97,39 @@ def test_a_name_is_the_rest_of_the_line_and_renames_a_session_already_on(monkeyp
     assert renamed["pid"] != first["pid"]  # the bridge was started again, to take the name
 
 
-def test_stop_needs_a_thread_outside_a_session(capsys):
-    with pytest.raises(SystemExit):
-        cli.main(["--stop"])
-    assert "--stop needs --thread" in capsys.readouterr().err
+def test_stop_outside_a_session_takes_the_only_bridge(capsys):
+    assert cli.main(["--stop"]) == 0
+    assert capsys.readouterr().out == "nothing is on Remote Control\n"
+    background.start(THREAD, [])
+    assert cli.main(["--stop"]) == 0
+    assert capsys.readouterr().out == "off Remote Control\n"
+    assert background.running(THREAD) is None
+
+
+def test_stop_asks_which_when_there_are_several(capsys):
+    background.start(THREAD, [])
+    background.start("thr-2", [])
+    try:
+        with pytest.raises(SystemExit):
+            cli.main(["--stop"])
+        said = capsys.readouterr()
+        assert "name one with --thread" in said.err and "thr-2" in said.out
+        assert cli.main(["--stop", "--thread", "thr-2"]) == 0
+    finally:
+        background.stop("thr-2")
+
+
+def test_list_shows_what_is_on_remote_control(capsys):
+    assert cli.main(["--list"]) == 0
+    assert capsys.readouterr().out == "nothing is on Remote Control\n"
+    background.start(THREAD, ["--", "My Project"])
+    assert cli.main(["--list"]) == 0
+    assert capsys.readouterr().out == 'thr-1  https://claude.ai/code/session_1  "My Project"\n'
+
+
+def test_an_attached_file_is_kept_private_until_its_thread_is_gone(state):
+    path = background.save_upload(THREAD, "0123456789abcdef", "../../etc/notes.txt", b"hi")
+    assert path == state / "uploads" / THREAD / "01234567-notes.txt" and path.read_bytes() == b"hi"
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    background.drop_uploads(THREAD)
+    assert not path.parent.exists()

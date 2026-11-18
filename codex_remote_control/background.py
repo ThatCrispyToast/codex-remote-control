@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -96,6 +97,32 @@ def running(thread_id: str) -> dict | None:
             except ValueError:  # caught between two writes
                 return {}
     return None
+
+
+def save_upload(thread_id: str, file_uuid: str, name: str, data: bytes) -> Path:
+    """Keep a file the app attached to a message where Codex can read it:
+    beside the bridges' records, in a directory of the thread's own."""
+    folder = state_dir() / "uploads" / thread_id
+    _private(state_dir())
+    _private(folder)
+    path = folder / f"{file_uuid[:8]}-{os.path.basename(name) or 'file'}"
+    path.write_bytes(data)
+    return path
+
+
+def drop_uploads(thread_id: str) -> None:
+    """Forget the files attached to a thread that is gone."""
+    shutil.rmtree(state_dir() / "uploads" / thread_id, ignore_errors=True)
+
+
+def bridges() -> dict[str, dict]:
+    """Every running bridge's record, by the thread it serves."""
+    found = {}
+    for path in sorted(state_dir().glob("*.json")):
+        info = running(path.stem)
+        if info is not None:
+            found[path.stem] = info
+    return found
 
 
 def start(thread_id: str, options: list[str], *, timeout: float = 60.0) -> dict:

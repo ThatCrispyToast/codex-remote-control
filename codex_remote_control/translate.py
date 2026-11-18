@@ -12,9 +12,16 @@ command, an edit as a diff, a plan as a checklist.
 
 from __future__ import annotations
 
+import json
 import shlex
+import time
 
-from claude_rc import Event, worker_assistant, worker_tool_result
+from claude_rc import (
+    Event,
+    worker_assistant,
+    worker_compact_boundary,
+    worker_tool_result,
+)
 
 # A tool's output past this many characters is cut: the app is for following
 # along, and one event has a size limit.
@@ -74,8 +81,11 @@ def mode_settings(mode: str, settings: dict) -> dict:
 
 
 # -- what the user sends ------------------------------------------------------
-def user_input(message: Event) -> list[dict]:
-    """A controller's `user` message as Codex turn input: its text and images."""
+def user_input(message: Event, attached: list[dict] | None = None) -> list[dict]:
+    """A controller's `user` message as Codex turn input: its text, its
+    images, and the files the app attached to it. The app attaches by
+    reference and the bridge fetches: ``attached`` has one entry per file,
+    ``{name, path, image}`` once saved, ``{name}`` alone if it could not be."""
     content = message.payload.get("message", {}).get("content")
     blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
     out = []
@@ -85,6 +95,16 @@ def user_input(message: Event) -> list[dict]:
         elif block.get("type") == "image" and block.get("source", {}).get("type") == "base64":
             source = block["source"]
             out.append({"type": "image", "url": f"data:{source['media_type']};base64,{source['data']}"})
+    notes = []
+    for file in attached or []:
+        if file.get("path") and file.get("image"):
+            out.append({"type": "localImage", "path": file["path"]})
+        elif file.get("path"):
+            notes.append(f"[Attached file: {file['path']}]")
+        else:
+            notes.append(f"[An attached file, {file['name']}, could not be fetched]")
+    if notes:
+        out.append({"type": "text", "text": "\n".join(notes), "text_elements": []})
     return out
 
 
@@ -142,6 +162,13 @@ def tool_calls(item: dict) -> list[dict]:
         calls = [(f"mcp__{item['server']}__{item['tool']}", item.get("arguments") or {})]
     elif kind == "webSearch":
         calls = [("WebSearch", {"query": item.get("query") or ""})]
+    elif kind == "dynamicToolCall":
+        calls = [("__".join(filter(None, (item.get("namespace"), item["tool"]))), item.get("arguments") or {})]
+    elif kind == "imageView":
+        calls = [("Read", {"file_path": item["path"]})]
+    elif kind == "collabAgentToolCall" and item["tool"] == "spawnAgent":
+        prompt = item.get("prompt") or ""
+        calls = [("Agent", {"description": prompt.strip().split("\n")[0][:80], "prompt": prompt, "subagent_type": "codex"})]
     else:
         return []
     return [
@@ -170,6 +197,12 @@ def tool_output(item: dict) -> tuple[str, bool]:
             return item["error"]["message"], True
         parts = (item.get("result") or {}).get("content") or []
         return "\n".join(p.get("text", "") for p in parts if isinstance(p, dict)), failed
+    if kind == "dynamicToolCall":
+        parts = item.get("contentItems") or []
+        return "\n".join(p.get("text", "") for p in parts if isinstance(p, dict)), failed or item.get("success") is False
+    if kind == "collabAgentToolCall":
+        said = [state.get("message") for state in (item.get("agentsStates") or {}).values()]
+        return "\n\n".join(filter(None, said)), failed
     return "", failed
 
 
@@ -179,8 +212,7 @@ def transcript(item: dict, model: str) -> list[dict]:
     kinds of item the app has no way to show."""
     kind = item["type"]
     if kind == "userMessage":
-        text = "\n".join(part["text"] for part in item["content"] if part.get("type") == "text")
-        return [{"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": text}}]
+        return [{"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": typed(item["content"])}}]
     if kind == "agentMessage":
         if not item["text"]:
             return []
@@ -189,12 +221,55 @@ def transcript(item: dict, model: str) -> list[dict]:
         return [worker_assistant(item["text"], model=model)]
     if kind == "reasoning":
         summary = "\n\n".join(item.get("summary") or [])
-        return [worker_assistant([{"type": "thinking", "thinking": summary, "signature": ""}], model=model)] if summary else []
+        thought = [{"type": "thinking", "thinking": summary, "signature": ""}]
+        return [worker_assistant(thought, model=model, message_id=item["id"])] if summary else []
+    if kind == "enteredReviewMode":
+        return [worker_assistant(f"Reviewing {item['review']}.", model=model)] if item.get("review") else []
+    if kind == "exitedReviewMode":  # see turn_transcript(): the review is usually a message of the turn too
+        return [worker_assistant(item["review"], model=model, stop_reason="end_turn")] if item.get("review") else []
+    if kind == "imageGeneration":
+        return [worker_assistant(f"Generated an image: `{item['savedPath']}`", model=model)] if item.get("savedPath") else []
+    if kind == "contextCompaction":
+        return [compact_boundary()]
     calls = tool_calls(item)
     if not calls:
         return []
     output, failed = tool_output(item)
     return [worker_assistant(calls, model=model), *(worker_tool_result(c["id"], output, is_error=failed) for c in calls)]
+
+
+def turn_transcript(items: list[dict], model: str) -> list[dict]:
+    """A finished turn's items as transcript events. Codex reports a review's
+    findings twice, as the item that ends the review and as a message of the
+    turn: they are written once."""
+    said = {item["text"] for item in items if item["type"] == "agentMessage"}
+    return [
+        event for item in items
+        if not (item["type"] == "exitedReviewMode" and item.get("review") in said)
+        for event in transcript(item, model)
+    ]
+
+
+def typed(content: list[dict]) -> str:
+    """A Codex user message as the text the transcript shows: what was typed,
+    with a line for each thing attached to it."""
+    lines = []
+    for part in content:
+        kind = part.get("type")
+        if kind == "text":
+            lines.append(part["text"])
+        elif kind in ("image", "localImage"):
+            lines.append(f"[image: {part['path']}]" if part.get("path") else "[image]")
+        elif kind in ("mention", "skill"):
+            lines.append(f"[{part['name']}: {part['path']}]")
+    return "\n".join(lines)
+
+
+def compact_boundary(trigger: str = "auto", before: dict | None = None) -> dict:
+    """The mark the app draws where the thread's context was compacted.
+    ``before`` is the thread's `tokenUsage` as the compaction began."""
+    used = ((before or {}).get("last") or {}).get("totalTokens")
+    return worker_compact_boundary(trigger=trigger, pre_tokens=used)
 
 
 def todos(plan: list[dict]) -> dict:
@@ -207,17 +282,115 @@ def todos(plan: list[dict]) -> dict:
 
 
 # -- approvals as permission prompts ------------------------------------------
-def approval_answer(request: dict, allow: bool) -> dict:
+def session_rule(command: str) -> list[dict]:
+    """What makes the app offer "Always allow" on a command's permission
+    card: a rule for that command. The card says it lasts for the session
+    and covers that command, and an answer that takes it carries the rule
+    back as its `updatedPermissions`."""
+    rule = {"toolName": "Bash", "ruleContent": command}
+    return [{"type": "addRules", "rules": [rule], "behavior": "allow", "destination": "session"}]
+
+
+def approval_key(params: dict) -> str:
+    """What a command approval asks for, as the key an "Always allow" is
+    remembered under: the same command, in the same directory, wanting the
+    same extra access."""
+    asked = (params.get("command"), params.get("cwd"), params.get("additionalPermissions"), params.get("networkApprovalContext"))
+    return json.dumps(asked, sort_keys=True)
+
+
+def approval_answer(request: dict, allow: bool, *, standing: bool = False) -> dict:
     """The result for one of the app-server's approval requests. A refusal is
     `decline` (the turn goes on without it) where Codex offers that, else
-    `cancel`."""
+    `cancel`. A ``standing`` yes to a command is `acceptForSession` where
+    Codex offers that: it then remembers the answer itself. Its other
+    standing answer, a rule it writes down for commands like this one,
+    outlasts the session, which is more than the app's card promises."""
     if request["method"] == "item/permissions/requestApproval":
         granted = {k: v for k, v in request["params"]["permissions"].items() if v} if allow else {}
         return {"permissions": granted, "scope": "turn"}
-    if allow:
-        return {"decision": "accept"}
+    if request["method"] == "mcpServer/elicitation/request":
+        return elicitation_answer(request["params"], {} if allow else None)
     offered = request["params"].get("availableDecisions")
+    if allow:
+        remembered = standing and request["method"] == "item/commandExecution/requestApproval" and "acceptForSession" in (offered or ())
+        return {"decision": "acceptForSession" if remembered else "accept"}
     return {"decision": "decline" if offered is None or "decline" in offered else "cancel"}
+
+
+# -- MCP servers asking the user ------------------------------------------------
+_YES_NO = {"Yes": True, "No": False}
+
+
+def _choices(schema: dict) -> list[tuple[str, str, object]] | None:
+    """One form field's choices as (label, description, value), if it is a
+    field the app's question card can ask: a yes/no, or a pick of one from
+    up to four."""
+    if schema.get("type") == "boolean":
+        return [(label, "", value) for label, value in _YES_NO.items()]
+    if schema.get("type") != "string":
+        return None
+    if "oneOf" in schema:
+        options = [(o.get("title") or o["const"], "", o["const"]) for o in schema["oneOf"]]
+    elif "enum" in schema:
+        options = [(value, "", value) for value in schema["enum"]]
+    else:
+        return None
+    return options if 2 <= len(options) <= 4 else None
+
+
+def elicitation_prompt(params: dict) -> tuple[str, dict, str] | None:
+    """An MCP server's request to the user (`mcpServer/elicitation/request`)
+    as a prompt the app can show: the tool to name, its input, and what is
+    being asked. None for the kinds only a Codex terminal can answer.
+
+    A request with nothing to fill in is a yes or no, which is how Codex asks
+    whether an MCP tool may run. A link to open is one too. A form made only
+    of choices becomes a question card."""
+    server, mode = params["serverName"], params.get("mode")
+    if mode == "url":
+        return f"mcp__{server}", {"url": params["url"]}, f"{params['message']}\n{params['url']}"
+    if mode != "form":
+        return None
+    fields = (params.get("requestedSchema") or {}).get("properties") or {}
+    if not fields:
+        shown = (params.get("_meta") or {}).get("tool_params") or {}
+        return f"mcp__{server}", shown if isinstance(shown, dict) else {}, params["message"]
+    if len(fields) > 4 or any(_choices(schema) is None for schema in fields.values()):
+        return None
+    questions = [
+        {
+            "question": schema.get("description") or schema.get("title") or name,
+            "header": (schema.get("title") or name)[:12],
+            "multiSelect": False,
+            "options": [{"label": label, "description": text} for label, text, _ in _choices(schema)],
+        }
+        for name, schema in fields.items()
+    ]
+    return "AskUserQuestion", {"questions": questions}, params["message"]
+
+
+def elicitation_answer(params: dict, answers: dict | None) -> dict:
+    """The result for an MCP server's request: declined when ``answers`` is
+    None, else accepted with the form filled from the app's answers (question
+    text to label). A required field left unanswered declines it."""
+    if answers is None:
+        return {"action": "decline", "content": None, "_meta": None}
+    schema = params.get("requestedSchema") or {}
+    content = {}
+    for name, field in (schema.get("properties") or {}).items():
+        picked = answers.get(field.get("description") or field.get("title") or name)
+        picked = picked[0] if isinstance(picked, list) and picked else picked
+        value = next((value for label, _, value in _choices(field) or [] if label == picked), None)
+        if value is not None:
+            content[name] = value
+        elif name in (schema.get("required") or []):
+            return {"action": "decline", "content": None, "_meta": None}
+    return {
+        "action": "accept",
+        "content": content if params.get("mode") == "form" else None,
+        "_meta": None,
+    }
 
 
 def question_prompt(questions: list[dict]) -> dict:
@@ -242,6 +415,99 @@ def question_answers(questions: list[dict], answers: dict) -> dict:
         answer = answers.get(q["question"])
         out[q["id"]] = {"answers": [] if answer is None else answer if isinstance(answer, list) else [answer]}
     return {"answers": out}
+
+
+# -- what the session says about itself ------------------------------------------
+_MCP_STATUS = {
+    "connected": "connected", "authenticationRequired": "needs-auth", "failed": "failed",
+    "disabled": "disabled", "cancelled": "failed",
+}
+
+
+def mcp_servers(statuses: list[dict]) -> list[dict]:
+    """Codex's MCP servers (`mcpServerStatus/list`) as Claude Code lists its
+    own: a name and a status the app knows."""
+    return [
+        {"name": server["name"], "status": _MCP_STATUS.get(server.get("runtimeStatus"), "pending")}
+        for server in statuses
+    ]
+
+
+def side_prompt(question: str, history: list[dict] | None) -> str:
+    """A side question as the prompt Codex samples an answer to: the question,
+    after what was asked and answered beside the conversation before it."""
+    earlier = [
+        f"Q: {entry['question']}\nA: {entry['response']}"
+        for entry in history or [] if entry.get("question") and entry.get("response")
+    ]
+    asked = (
+        "Answer this side question from the conversation so far, briefly, without using tools. "
+        "It is not part of the task and changes nothing about it."
+    )
+    return "\n\n".join([asked, *earlier, f"Q: {question}"])
+
+
+def _tokens(count: int) -> str:
+    return f"{count / 1000:.1f}k" if count >= 1000 else str(count)
+
+
+def _window(minutes: int | None) -> str:
+    if not minutes:
+        return "current"
+    if minutes % 10080 == 0:
+        return "weekly" if minutes == 10080 else f"{minutes // 10080}-week"
+    if minutes % 1440 == 0:
+        return "daily" if minutes == 1440 else f"{minutes // 1440}-day"
+    return f"{minutes // 60}-hour" if minutes % 60 == 0 else f"{minutes}-minute"
+
+
+def limits(rate_limits: dict | None) -> list[str]:
+    """Codex's rate limits (`account/rateLimits/read`) as lines of text."""
+    lines = []
+    for window in ((rate_limits or {}).get("primary"), (rate_limits or {}).get("secondary")):
+        if not window:
+            continue
+        line = f"{round(window['usedPercent'])}% of the {_window(window.get('windowDurationMins'))} limit used"
+        if window.get("resetsAt"):
+            line += time.strftime(", resets %b %-d at %H:%M", time.localtime(window["resetsAt"]))
+        lines.append(line)
+    return lines
+
+
+def sandbox(settings: dict) -> str:
+    """A thread's sandbox and approval settings in a sentence."""
+    policy = settings["sandboxPolicy"]
+    access = {
+        "readOnly": "read-only",
+        "workspaceWrite": "can write in the workspace",
+        "dangerFullAccess": "full access",
+    }.get(policy["type"], policy["type"])
+    network = "" if policy["type"] == "dangerFullAccess" else f", network {'on' if policy.get('networkAccess') else 'off'}"
+    reviewer = "you" if settings.get("approvalsReviewer", "user") == "user" else "the Codex reviewer"
+    asks = {"never": "never asks", "on-request": f"asks {reviewer} when it needs more", "untrusted": f"asks {reviewer} before anything untrusted"}
+    return f"Sandbox: {access}{network}. Approvals: {asks.get(settings['approvalPolicy'], settings['approvalPolicy'])}."
+
+
+def report(*, thread: dict, settings: dict, usage: dict | None, rate_limits: dict | None, models: list[str]) -> str:
+    """What `/codex` answers: the Codex side of the session, which the app's
+    own status and usage cards (they describe the Claude account) leave out."""
+    effort = settings.get("effort")
+    lines = [
+        f"**Codex {thread.get('cliVersion') or ''}**".replace(" **", "**"),
+        f"- Thread: `{thread['id']}` in `{settings['cwd']}`",
+        f"- Model: `{settings['model']}`" + (f", effort `{effort}`" if effort else ""),
+        f"- {sandbox(settings)}",
+    ]
+    used = ((usage or {}).get("last") or {}).get("totalTokens")
+    if used is not None:
+        window = (usage or {}).get("modelContextWindow")
+        lines.append(f"- Context: {_tokens(used)}" + (f" of {_tokens(window)} tokens ({round(100 * used / window)}%)" if window else " tokens"))
+    lines += [f"- Usage: {line}" for line in limits(rate_limits)]
+    if plan := (rate_limits or {}).get("planType"):
+        lines.append(f"- Plan: {plan}")
+    lines.append(f"- Models, for `/model <id>`: {', '.join(f'`{m}`' for m in models)}")
+    lines.append(f"- In a terminal: `codex resume {thread['id']}`")
+    return "\n".join(lines)
 
 
 # -- usage ----------------------------------------------------------------------
