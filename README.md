@@ -4,7 +4,7 @@ Open a local Codex thread in the Claude app or at [claude.ai/code](https://claud
 Send a prompt from your phone, watch Codex run commands on your machine, and
 review diffs and approval requests in the chat.
 
-![Claude Desktop and the Codex terminal side by side. A prompt in Claude asks Codex to summarize the project. Codex reads the README and the reply appears in both windows.](docs/demo.gif)
+![The terminal installs codex-rc with uv and starts Codex. A session named codex-remote-control-test appears under Remote Control in the Claude Desktop sidebar. A prompt sent from Claude and the reply appear in both windows.](docs/demo.gif)
 
 ## Quickstart
 
