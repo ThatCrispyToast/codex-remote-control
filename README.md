@@ -4,7 +4,7 @@ Open a local Codex thread in the Claude app or at [claude.ai/code](https://claud
 Send a prompt from your phone, watch Codex run commands on your machine, and
 review diffs and approval requests in the chat.
 
-![Replay of a live Remote Control session. Codex receives a request to read VERSION, runs cat VERSION, and replies that the release is 0.4.2.](docs/demo.gif)
+![Claude Desktop and the Codex terminal side by side. A prompt in Claude asks Codex to summarize the project. Codex reads the README and the reply appears in both windows.](docs/demo.gif)
 
 ## Quickstart
 
