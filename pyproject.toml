@@ -16,7 +16,7 @@ dependencies = [
 test = ["pytest>=8.0"]
 
 [project.scripts]
-codex-remote-control = "codex_remote_control.cli:main"
+codex-rc = "codex_remote_control.cli:main"
 
 [build-system]
 requires = ["hatchling"]

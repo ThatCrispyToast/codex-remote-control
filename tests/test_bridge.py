@@ -339,7 +339,7 @@ def test_every_control_request_gets_an_answer(bridge):
     assert [call[1]["totalTokens"] if "totalTokens" in call[1] else call[1] for call in bridge.worker.calls("respond")] == [
         0, {"diff": None}]
     assert [call[1] for call in bridge.worker.calls("reject")] == [
-        "codex-remote-control does not handle control_request subtype: mcp_set_servers",
+        "codex-rc does not handle control_request subtype: mcp_set_servers",
         "Codex refused: thread/name/set: no"]
 
 
@@ -428,7 +428,7 @@ def test_stopping_mid_turn_closes_what_the_app_shows_as_open(bridge):
     bridge._leave()
     assert bridge.worker.log == []  # idle: nothing to close
     bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
-    bridge._from_codex(item("started", **COMMAND))  # `codex-remote-control --stop`, say
+    bridge._from_codex(item("started", **COMMAND))  # `codex-rc --stop`, say
     bridge._leave()
     call = bridge.worker.events()[0]["message"]["content"][0]
     closed = bridge.worker.events()[1]["message"]["content"][0]

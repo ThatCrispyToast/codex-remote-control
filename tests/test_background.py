@@ -9,10 +9,12 @@ THREAD = "thr-1"
 
 # Stands in for the bridge: claims its thread, reports a session, and waits to be stopped.
 BRIDGE = """
-import signal, sys, time
+import os, signal, sys, time
 from codex_remote_control import background
-record = background.claim(sys.argv[1])
-record.update(session="https://claude.ai/code/session_1", options=sys.argv[2:])
+thread, options = sys.argv[1], sys.argv[2:]
+record = background.claim(thread)
+title = options[options.index("--") + 1] if "--" in options else "Codex: w"
+record.update(session="https://claude.ai/code/session_1", title=title, options=options, env=os.environ.get("CODEX_THREAD_ID"))
 signal.signal(signal.SIGTERM, lambda *_: (record.close(), sys.exit(0)))
 time.sleep(60)
 """
@@ -71,16 +73,30 @@ def test_a_bridge_that_does_not_come_up_says_why(state, monkeypatch):
 def test_typed_in_a_session_it_serves_that_session_from_the_background(monkeypatch, capsys):
     monkeypatch.setenv("CODEX_THREAD_ID", THREAD)
     assert cli.main([]) == 0
-    assert "on Remote Control: https://claude.ai/code/session_1" in capsys.readouterr().out
-    assert background.running(THREAD) is not None
+    assert capsys.readouterr().out.startswith('on Remote Control as "Codex: w": https://claude.ai/code/session_1\n')
+    bridge = background.running(THREAD)
+    assert bridge["env"] is None  # the bridge is not itself "typed in a session"
+    assert cli.main([]) == 0  # again: the same bridge, and its link
+    assert background.running(THREAD)["pid"] == bridge["pid"]
     assert cli.main(["--stop"]) == 0
-    assert capsys.readouterr().out == "off Remote Control\n"
+    assert capsys.readouterr().out.endswith("off Remote Control\n")
     assert background.running(THREAD) is None
     assert cli.main(["--stop"]) == 0
     assert "not on Remote Control" in capsys.readouterr().out
 
 
+def test_a_name_is_the_rest_of_the_line_and_renames_a_session_already_on(monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_THREAD_ID", THREAD)
+    cli.main([])
+    first = background.running(THREAD)
+    assert cli.main(["My", "Project"]) == 0  # `!codex-rc My Project`
+    assert 'on Remote Control as "My Project"' in capsys.readouterr().out
+    renamed = background.running(THREAD)
+    assert renamed["options"] == ["--", "My Project"]
+    assert renamed["pid"] != first["pid"]  # the bridge was started again, to take the name
+
+
 def test_stop_needs_a_thread_outside_a_session(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--stop"])
-    assert "--stop needs a thread" in capsys.readouterr().err
+    assert "--stop needs --thread" in capsys.readouterr().err

@@ -1,7 +1,7 @@
 """Bridges that serve from a background process.
 
-`!codex-remote-control`, typed in a Codex session, has to hand the prompt back,
-so the bridge it starts runs in a process of its own. Every bridge keeps a
+`!codex-rc`, typed in a Codex session, has to hand the prompt back, so the
+bridge it starts runs in a process of its own. Every bridge keeps a
 record named for its thread and holds a lock on it for as long as it runs. That
 is how a later command finds it, to say the thread is already served or to stop
 it. The lock, not the pid, says a bridge is alive, so a record left behind by a
@@ -20,8 +20,8 @@ import time
 from pathlib import Path
 
 
-# What a background bridge runs: this package's own command, in the foreground.
-_COMMAND = [sys.executable, "-m", "codex_remote_control.cli"]
+# What a background bridge runs: this package's own command, told its thread.
+_COMMAND = [sys.executable, "-m", "codex_remote_control.cli", "--thread"]
 
 
 class StartFailed(Exception):
@@ -105,6 +105,8 @@ def start(thread_id: str, options: list[str], *, timeout: float = 60.0) -> dict:
                 stdout=log,
                 stderr=log,
                 start_new_session=True,  # out of reach of whatever ends the command that started it
+                # Not "typed in a session" itself, or it would start a bridge in turn.
+                env={k: v for k, v in os.environ.items() if k != "CODEX_THREAD_ID"},
             )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

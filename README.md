@@ -15,68 +15,86 @@ transcript, and its approval requests come up as permission cards.
 > Codex half uses app-server calls Codex marks experimental. Either can change
 > without notice. The session shows in your own Claude account only.
 
-## Requirements
+## Quickstart
 
-- Codex CLI 0.170 or later, signed in (`codex login`).
-- Claude Code signed in with a claude.ai account (`claude`, then `/login`).
-  The bridge reads that login from `~/.claude`; it does not need `claude` running.
-- [uv](https://docs.astral.sh/uv/), or any Python 3.10+ environment.
+You need the Codex CLI (0.170 or later) and Claude Code signed in with a
+claude.ai account on the same machine (`claude`, then `/login`). The bridge
+uses that login; `claude` doesn't have to be running.
 
-## Use
+1. Install the `codex-rc` command, with [uv](https://docs.astral.sh/uv/):
 
-From a checkout, `uv run --project <checkout> codex-remote-control` runs it in
-whatever directory you are in, and `uv tool install <checkout>` puts the
-command on your PATH.
+   ```bash
+   uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control
+   ```
 
-### From inside a Codex session
+2. In a Codex session, type:
 
-In the session you want on Remote Control, type:
+   ```
+   !codex-rc
+   ```
+
+   ```
+   • You ran codex-rc
+     └ on Remote Control as "Codex: project": https://claude.ai/code/session_01B2vst…
+       take it off with: codex-rc --stop
+   ```
+
+3. Open the link, or pick the session under Remote Control in claude.ai/code
+   or the Claude app.
+
+If your shell doesn't find `codex-rc`, `uv tool update-shell` puts uv's tools
+on your PATH. `pipx install git+https://github.com/ThatCrispyToast/codex-remote-control`
+works as well.
+
+## In a Codex session
+
+`!codex-rc` is the counterpart of Claude Code's `/remote-control`. It is a `!`
+command because Codex's `/` commands are a fixed list that nothing can add to,
+while `!` runs a program of yours on the spot, outside the sandbox and without
+a model turn, and tells it which session it was typed in.
 
 ```
-!codex-remote-control
+!codex-rc                 # put this session on Remote Control
+!codex-rc My Project      # ... under a name of your choosing
+!codex-rc --stop          # take it off
 ```
 
-```
-• You ran codex-remote-control
-  └ on Remote Control: https://claude.ai/code/session_01B2vst…
-    take it off with: codex-remote-control --stop
-```
+- **The name** is what the session is called in the app's list, as with
+  `/remote-control My Project` in Claude Code. Without one it is `Codex: ` and
+  the thread's name, or its directory until Codex names the thread. A name
+  sticks: the session keeps it when it is taken off and put on again, until
+  you give another, which you can at any time.
+- **It stays on** after you close the TUI. The thread lives on in Codex's
+  background server, so the app can keep working it, and `codex resume` opens
+  it again. Typing `!codex-rc` again shows the link again.
+- **A thread taken up mid-conversation** brings its latest 30 turns with it,
+  so the session reads from near the start rather than from the moment it
+  went on.
 
-This is the counterpart of Claude Code's `/remote-control`. It is a `!` command
-because Codex's `/` commands are a fixed list that nothing can add to, while
-`!` runs a program of yours on the spot, outside the sandbox and without a
-model turn, and tells it which session it was typed in.
+## From a shell
 
-The session then stays on Remote Control, also after you close the TUI: the
-thread lives on in Codex's background server, so the app can keep working it,
-and `codex resume` opens it again. Typing the command again shows the link
-again. `!codex-remote-control --stop` takes the session off, as does
-`codex-remote-control --stop <thread-id>` from a shell.
-
-### From a shell
+Outside a Codex session, `codex-rc` starts a thread of its own and serves it
+until interrupted:
 
 ```bash
-codex-remote-control                 # a new thread, working in this directory
-codex-remote-control -C ~/project    # ... in another one
-codex-remote-control --last          # this directory's most recent thread
-codex-remote-control <thread-id>     # a given thread, by the id `codex resume` takes
+codex-rc                       # a new thread, working in this directory
+codex-rc My Project            # ... under a name
+codex-rc -C ~/project          # ... in another directory
+codex-rc --last                # this directory's most recent thread
+codex-rc --thread <thread-id>  # a given thread, by the id `codex resume` takes
 ```
 
-It prints where to find both ends, then runs until interrupted:
+It prints where to find both ends:
 
 ```
 thread   01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e  (/home/me/project)
-session  https://claude.ai/code/session_01B2vst…
+session  https://claude.ai/code/session_01B2vst…  (Codex: project)
 tui      codex resume 01a1ed4f-3634-7eb3-9b4d-2a3a5f85632e
 ```
 
-`--name TITLE` sets the session's title (otherwise `Codex: ` and the thread's
-name, or its directory until Codex names it), `-m MODEL` the model of a new
-thread, `-v` logs what crosses the bridge.
-
-A thread taken up mid-conversation brings its latest 30 turns with it, so the
-session reads from near the start rather than from the moment it was served.
-Serving the same thread again finds its session again.
+`-m MODEL` sets the model of a new thread, `-v` logs what crosses the bridge,
+and `codex-rc --stop --thread <thread-id>` takes off a session that was put on
+from inside Codex. Serving the same thread again finds its session again.
 
 ## What the app's controls do
 
@@ -116,8 +134,7 @@ by name, a reasoning summary as a thinking block.
 
 Codex keeps one app-server per user and every `codex` TUI is a client of it.
 The bridge is another. So it can join the session a TUI has open, which is
-what `!codex-remote-control` does, and a TUI can open the thread a bridge
-serves:
+what `!codex-rc` does, and a TUI can open the thread a bridge serves:
 
 ```bash
 codex resume <thread-id>
@@ -131,10 +148,10 @@ answer takes the prompt down at the other).
 ## How it works
 
 ```
-claude.ai/code ──► Anthropic ──► codex-remote-control ──► Codex app-server ──► the model
-  and the apps      session       worker        client      (shared daemon)
-                                                               ▲
-                                                           codex TUI
+claude.ai/code ──► Anthropic ──► codex-rc ──► Codex app-server ──► the model
+  and the apps      session    worker  client   (shared daemon)
+                                                       ▲
+                                                   codex TUI
 ```
 
 - **Towards Codex** it is an app-server client on the daemon's control socket
@@ -170,14 +187,15 @@ logs there too, and one that ended by itself leaves that log behind.
   a turn that was running then ends as an error.
 - A session Codex runs without its shared background server can't be joined.
   That is one started with `-c`, `--enable`, `--disable` or `--search` (the TUI
-  says so in a startup warning), and `!codex-remote-control` there reports that
-  the thread "already has an active writer".
+  says so in a startup warning), and `!codex-rc` there reports that the
+  thread "already has an active writer".
 
 ## Development
 
 ```bash
-uv sync --extra test
+git clone https://github.com/ThatCrispyToast/codex-remote-control && cd codex-remote-control
 uv run --extra test pytest -q    # offline: no Codex, no network
+uv run codex-rc --help           # the working tree's command
 ```
 
 ```

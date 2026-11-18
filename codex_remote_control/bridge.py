@@ -48,11 +48,15 @@ _STREAM_FLUSH_S = 0.3
 _LEFT = "Remote Control was stopped before this finished."
 
 
+# What a session's title starts with unless someone named the session.
+TITLE_PREFIX = "Codex: "
+
+
 def session_title(thread_name: str | None, cwd: str) -> str:
     """What a thread's session is called in the app's list, where it sits
-    among Claude Code sessions: Codex's name for the thread once it has one,
-    its directory until then."""
-    return f"Codex: {thread_name or os.path.basename(cwd) or cwd}"
+    among Claude Code sessions, unless it was given a name: Codex's name for
+    the thread once it has one, its directory until then."""
+    return f"{TITLE_PREFIX}{thread_name or os.path.basename(cwd) or cwd}"
 
 
 def _settings(opened: dict) -> dict:
@@ -395,7 +399,7 @@ class Bridge:
             self.codex.request("thread/name/set", {"threadId": self.thread_id, "name": fields["title"]})
             self.worker.respond(request)
         else:
-            self.worker.reject(request, f"codex-remote-control does not handle control_request subtype: {subtype}")
+            self.worker.reject(request, f"codex-rc does not handle control_request subtype: {subtype}")
 
     # -- from Codex ------------------------------------------------------------
     def _from_codex(self, message: dict) -> None:
