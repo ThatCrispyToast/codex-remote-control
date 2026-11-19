@@ -35,6 +35,29 @@ _NOT_SHARED = (
 )
 
 
+def main_thread(thread_id: str) -> str:
+    """The thread a Codex session typed in belongs to. A side conversation is
+    a thread of its own, and a `!` command typed in it is given its id, but it
+    is a fork: serving it would serve the thread as it stood when the side
+    conversation began. A saved one names the thread it is attached to. A
+    temporary one names none, and Codex keeps no history of it to serve. If
+    Codex can't say, the id stands, and serving it reports what is wrong."""
+    codex = AppServer()
+    try:
+        codex.connect()
+        while True:
+            thread = codex.request("thread/read", {"threadId": thread_id})["thread"]
+            if thread.get("ephemeral"):
+                sys.exit("a temporary side conversation can't go on Remote Control: type !codex-rc in the main thread")
+            if not (parent := thread.get("attachedToThreadId")):
+                return thread_id
+            thread_id = parent
+    except (AppServerError, OSError, subprocess.CalledProcessError, ValueError, KeyError):
+        return thread_id
+    finally:
+        codex.close()
+
+
 def open_thread(codex: AppServer, args: argparse.Namespace) -> dict:
     """Subscribe to the thread to serve: the one named, the directory's most
     recent with `--last`, or a new one. Returns the app-server's answer, which
@@ -161,9 +184,15 @@ def main(argv: list[str] | None = None) -> int:
     args.thread = args.thread or (None if args.last else here)
     if args.list:
         return list_bridges()
+    side = False
+    if here and args.thread == here:
+        args.thread = main_thread(here)
+        side = args.thread != here
     if args.stop:
         return stop_bridge(args.thread, parser)
     if here and args.thread:
+        if side:
+            print("this is a side conversation: serving the thread it belongs to")
         return serve_from_background(args.thread, args)
     args.cd = os.path.abspath(args.cd)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(name)s: %(message)s")

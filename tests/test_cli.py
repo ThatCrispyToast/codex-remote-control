@@ -64,6 +64,69 @@ def test_a_session_keeps_the_name_it_was_given_until_it_is_given_another():
     assert account.calls[-1] == ("rename", "cse_old", "Other")
 
 
+class Codex:
+    """The app-server, with some threads to read and resume."""
+
+    def __init__(self, *threads):
+        self.threads = {thread["id"]: thread for thread in threads}
+
+    def connect(self):
+        pass
+
+    def close(self):
+        pass
+
+    def request(self, method, params):
+        return {"thread": self.threads[params["threadId"]]}
+
+
+MAIN = {"id": "thr-main", "attachedToThreadId": None}
+SIDE = {"id": "thr-side", "attachedToThreadId": "thr-main"}
+SIDE_OF_SIDE = {"id": "thr-side-2", "attachedToThreadId": "thr-side"}
+
+
+def typed_in(thread_id, monkeypatch, *threads):
+    """Run `!codex-rc` typed in a thread's session: which thread goes on Remote Control."""
+    monkeypatch.setenv("CODEX_THREAD_ID", thread_id)
+    monkeypatch.setattr(cli, "AppServer", lambda: Codex(*threads))
+    served = []
+    monkeypatch.setattr(cli, "serve_from_background", lambda thread, args: served.append(thread) or 0)
+    cli.main([])
+    return served[0]
+
+
+def test_typed_in_the_main_thread_it_serves_that_thread(monkeypatch, capsys):
+    assert typed_in("thr-main", monkeypatch, MAIN, SIDE) == "thr-main"
+    assert capsys.readouterr().out == ""
+
+
+def test_typed_in_a_side_conversation_it_serves_the_thread_it_belongs_to(monkeypatch, capsys):
+    """Serving the side conversation would serve the thread as it stood when that began."""
+    assert typed_in("thr-side", monkeypatch, MAIN, SIDE) == "thr-main"
+    assert typed_in("thr-side-2", monkeypatch, MAIN, SIDE, SIDE_OF_SIDE) == "thr-main"
+    assert "side conversation" in capsys.readouterr().out
+
+
+def test_when_codex_cannot_say_the_thread_typed_in_is_served(monkeypatch):
+    """Serving it then reports what is wrong, as it always has."""
+
+    class Gone(Codex):
+        def connect(self):
+            raise ConnectionRefusedError("no daemon")
+
+    monkeypatch.setenv("CODEX_THREAD_ID", "thr-side")
+    monkeypatch.setattr(cli, "AppServer", Gone)
+    monkeypatch.setattr(cli, "serve_from_background", lambda thread, args: thread)
+    assert cli.main([]) == "thr-side"
+
+
+def test_typed_in_a_temporary_side_conversation_it_says_where_to_type_it(monkeypatch):
+    """Codex keeps no history of a temporary side conversation, nor which thread it came from."""
+    with pytest.raises(SystemExit) as stopped:
+        typed_in("thr-temp", monkeypatch, {"id": "thr-temp", "ephemeral": True})
+    assert "type !codex-rc in the main thread" in str(stopped.value)
+
+
 def test_a_thread_id_given_as_a_name_is_caught(monkeypatch, capsys):
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     with pytest.raises(SystemExit):

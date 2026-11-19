@@ -61,6 +61,8 @@ codex-rc --stop --thread <thread-id>   # stop that one
 - A new session starts with the thread's last 30 turns.
 - Closing the terminal leaves the session up. `codex resume` rejoins it.
 - Archiving the session in Claude stops the bridge.
+- In a side conversation, `!codex-rc` serves the thread it came from. A temporary
+  one can't tell which that is, and says to type it in the main thread.
 
 ### In Claude
 

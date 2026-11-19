@@ -34,6 +34,13 @@ what neither the README nor the code will tell you.
 - A Codex started with `-c`, `--enable`, `--disable` or `--search` runs
   **embedded**, off the shared daemon, and cannot be joined: `thread/resume`
   answers "already has an active writer". `-m` alone keeps it on the daemon.
+- A side conversation (`/side`, `/btw`) is a thread of its own, forked from
+  the one it was opened in, and a `!` command typed in it, or in its pane,
+  gets its id. Served as it is, it shows the parent as it stood when the side
+  conversation began. A saved one (the experimental `tui_workspace` feature)
+  names its parent as `attachedToThreadId`. A temporary one is `ephemeral` and
+  names none: `thread/read` answers while it is open, `thread/resume` finds
+  "no rollout" and `thread/turns/list` refuses it.
 - `thread/settings/update` does not validate a model id, so the bridge checks
   one against `model/list` itself.
 - A thread nobody has written to yet is "not materialized": `thread/turns/list`
@@ -118,6 +125,11 @@ Codex plan and a real Claude account:
 - A directory Codex has not seen makes the TUI ask for folder trust, and the
   answer is saved to the user's Codex config. Run a test TUI in a directory
   that is already trusted.
+- A TUI started with `--enable tui_workspace` offers to restart the shared
+  daemon with that feature, which then holds for every client. Pick "Run
+  without daemon this time". That TUI is embedded and can't be joined, so test
+  a saved side conversation with `CODEX_THREAD_ID=<its id> codex-rc` once the
+  TUI has quit.
 - Leave nothing running: stop the bridges a test started (`codex-rc --stop`)
   and check the state directory is empty.
 - `uv run` syncs the environment to the lockfile, so it cannot run against an

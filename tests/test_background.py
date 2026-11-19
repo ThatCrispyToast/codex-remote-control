@@ -25,6 +25,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.setattr(background, "_COMMAND", [sys.executable, "-c", BRIDGE])
+    monkeypatch.setattr(cli, "main_thread", lambda thread_id: thread_id)  # no Codex to ask
     yield tmp_path / "codex-remote-control"
     background.stop(THREAD)
 
