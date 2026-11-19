@@ -1,6 +1,6 @@
 # codex-remote-control
 
-Control a local Codex session from the Claude app or [claude.ai/code](https://claude.ai/code).
+Control a local Codex session from the official Claude apps or [claude.ai/code](https://claude.ai/code).
 
 ![Codex in a terminal beside the same session in Claude Desktop](docs/demo.gif)
 
@@ -14,7 +14,7 @@ same machine, signed in (`claude`, then `/login`).
 uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control
 
 # At the Codex prompt
-!codex-rc
+!codex-rc "optional-session-name"
 ```
 
 Open the link it prints, or pick the session under **Remote Control** in Claude.
