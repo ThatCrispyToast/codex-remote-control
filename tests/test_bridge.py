@@ -2,6 +2,7 @@
 import pytest
 from claude_rc import APIError, Event
 
+from codex_remote_control import bridge as bridge_module
 from codex_remote_control import workspace
 from codex_remote_control.appserver import AppServerError
 from codex_remote_control.bridge import Bridge, ThreadClosed, session_title
@@ -52,8 +53,12 @@ class Worker:
         self.prompts = 0
         self.held = []  # the session's own events, newest first, as `list_events` answers
         self.files = {}  # what `download_file` has, by file uuid
+        self.uploads = []  # how many events each upload carried
 
     def send(self, *payloads, ephemeral=False):
+        if len(payloads) > 100:
+            raise APIError(400, "events: must contain no more than 100 item(s)", None)  # as claude.ai answers
+        self.uploads.append(len(payloads))
         self.log += [("ephemeral" if ephemeral else "event", p) for p in payloads]
         return {"has_subscribers": self.watched}
 
@@ -750,6 +755,12 @@ def turn(n, status="completed"):
         {"type": "agentMessage", "id": f"msg_{n}", "text": f"a{n}"}]}
 
 
+def long_turn(n, said, status="completed"):
+    """A turn left to work: one prompt, and ``said`` messages from Codex."""
+    return {**turn(n, status), "items": turn(n)["items"][:1] + [
+        {"type": "agentMessage", "id": f"msg_{n}_{i}", "text": f"a{n}.{i}"} for i in range(said)]}
+
+
 def result(turn_id=None, **fields):
     return Event.from_wire({"sequence_num": 1, "event_id": "ev", "source": "worker", "payload": {
         "type": "result", "num_turns": 1, **({"codex_turn": turn_id} if turn_id else {}), **fields}})
@@ -772,6 +783,28 @@ def test_a_session_served_before_catches_up_on_the_turns_since(bridge):
     bridge.worker.held = [result(None, num_turns=0), result("t1")]  # a command's answer, then the last turn written
     bridge.backfill(new=False)
     assert [event["codex_turn"] for event in bridge.worker.events() if event["type"] == "result"] == ["t2", "t3"]
+
+
+def test_a_long_turn_is_written_in_uploads_claude_ai_takes(bridge):
+    """claude.ai takes at most 100 events in one upload, and turns can hold a thousand items."""
+    bridge.codex.results["thread/turns/list"] = {"data": [long_turn(2, 230, status="inProgress"), long_turn(1, 150)]}
+    bridge.backfill(new=True)
+    assert max(bridge.worker.uploads) == 100
+    assert len(bridge.worker.events()) == (1 + 150 + 1) + (1 + 229)  # the running turn's last message is still to come
+
+
+def test_a_long_history_is_cut_to_the_latest_turns_it_has_room_for(bridge, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_BACKFILL_ITEMS", 10)
+    bridge.codex.results["thread/turns/list"] = {"data": [long_turn(4, 3), long_turn(3, 5), long_turn(2, 1), turn(1)]}
+    bridge.backfill(new=True)
+    assert [event["codex_turn"] for event in bridge.worker.events() if event["type"] == "result"] == ["t3", "t4"]
+
+    # The latest turn is written whatever its size.
+    monkeypatch.setattr(bridge_module, "_BACKFILL_ITEMS", 2)
+    fresh = Bridge(Codex(), Worker(), OPENED, follow_name=True)
+    fresh.codex.results["thread/turns/list"] = {"data": [long_turn(2, 40), turn(1)]}
+    fresh.backfill(new=True)
+    assert [event["codex_turn"] for event in fresh.worker.events() if event["type"] == "result"] == ["t2"]
 
 
 def test_a_transcript_that_does_not_name_its_turns_is_left_alone(bridge):

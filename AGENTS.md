@@ -85,6 +85,10 @@ what neither the README nor the code will tell you.
 - "Always allow" shows on a card only for a `permission_suggestions` rule
   with a `ruleContent`, which in practice means a command. The card says it
   "lasts for this session", whatever the rule's `destination`.
+- An upload to the session takes at most 100 events, or claude.ai answers
+  400 ("events: must contain no more than 100 item(s)"). A Codex turn left to
+  work for hours holds a thousand items, so the bridge splits its uploads and
+  backfills by items as well as turns.
 - `system/informational` is not drawn. A notice has to be an assistant
   message to be seen.
 - Answers that take time (`get_workspace_diff`, `file_suggestions`,

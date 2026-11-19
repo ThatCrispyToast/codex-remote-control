@@ -52,9 +52,13 @@ _RECONNECT_TRIES = 8
 _STREAM_FLUSH_S = 0.3
 # What a tool call and a turn still open when the bridge is stopped end as.
 _LEFT = "Remote Control was stopped before this finished."
-# How many of a thread's latest turns a session is given, to start with or to
-# catch up on.
+# How much of a thread's history a session is given, to start with or to catch
+# up on: its latest turns, up to this many, and only as many items as the
+# second number allows. A turn left to work for hours can hold a thousand.
 _BACKFILL_TURNS = 30
+_BACKFILL_ITEMS = 1000
+# The most events claude.ai takes in one upload.
+_UPLOAD_EVENTS = 100
 # The largest file the app may attach to a message.
 _ATTACHMENT_BYTES = 25 * 1024 * 1024
 # How far back a session's events are searched for the last turn written to it.
@@ -96,6 +100,18 @@ def _settings(opened: dict) -> dict:
         "sandboxPolicy": opened["sandbox"],
         "collaborationMode": opened.get("collaborationMode"),
     }
+
+
+def _latest(turns: list[dict], items: int) -> list[dict]:
+    """The newest of ``turns`` (newest first) that hold no more than ``items``
+    items between them, and the newest turn whatever its size."""
+    kept: list[dict] = []
+    for turn in turns:
+        items -= len(turn["items"])
+        if kept and items < 0:
+            break
+        kept.append(turn)
+    return kept
 
 
 class ThreadClosed(Exception):
@@ -271,14 +287,14 @@ class Bridge:
             ids = [turn["id"] for turn in turns]
             if held in ids:
                 turns = turns[:ids.index(held)]
-        for turn in reversed(turns):
+        for turn in reversed(_latest(turns, _BACKFILL_ITEMS)):
             if turn["status"] == "inProgress":
                 self._write_running(turn)
                 continue
             events = translate.turn_transcript(turn["items"], self.model)
             if events:
                 done = worker_result(duration_ms=turn.get("durationMs") or 0, **{TURN_FIELD: turn["id"]})
-                self.worker.send(*events, done)
+                self._send(*events, done)
             self.backfilled.add(turn["id"])
 
     def _held_turn(self) -> str | None:
@@ -336,8 +352,10 @@ class Bridge:
         raise AppServerClosed("the Codex app-server did not come back")
 
     def _send(self, *payloads: dict) -> None:
-        """Write transcript events, and note whether anyone is watching."""
-        self.watched = self.worker.send(*payloads).get("has_subscribers", True)
+        """Write transcript events, in as many uploads as claude.ai needs, and
+        note whether anyone is watching."""
+        for start in range(0, len(payloads), _UPLOAD_EVENTS):
+            self.watched = self.worker.send(*payloads[start:start + _UPLOAD_EVENTS]).get("has_subscribers", True)
 
     # -- what the session says about itself ----------------------------------
     @property
