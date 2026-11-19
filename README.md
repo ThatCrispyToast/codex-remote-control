@@ -1,81 +1,70 @@
 # codex-remote-control
 
-Open a local Codex thread in the Claude app or at [claude.ai/code](https://claude.ai/code).
-Send a prompt from your phone, watch Codex run commands on your machine, and
-review diffs and approval requests in the chat. The app's Changes and Files
-panels, file mentions, attachments and side chat work on the thread's directory.
+Control a local Codex session from the Claude app or [claude.ai/code](https://claude.ai/code).
 
-![The terminal installs codex-rc with uv and starts Codex. A session named codex-remote-control-test appears under Remote Control in the Claude Desktop sidebar. A prompt sent from Claude and the reply appear in both windows.](docs/demo.gif)
+![Codex in a terminal beside the same session in Claude Desktop](docs/demo.gif)
 
 ## Quickstart
 
-You need the [Codex CLI](https://github.com/openai/codex) (0.170 or later) and
-Claude Code on the same machine. Run `claude`, sign in with `/login`, then quit.
-
-1. Install the bridge with [uv](https://docs.astral.sh/uv/).
-
-   ```sh
-   uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control
-   ```
-
-2. At the Codex prompt, enter `!codex-rc`.
-
-3. Open the link Codex prints, or select the session under **Remote Control**
-   in your Claude account.
-
-If Codex can't find `codex-rc`, run `uv tool update-shell`. For pipx, use
-`pipx install git+https://github.com/ThatCrispyToast/codex-remote-control`.
-
-## Managing a session
-
-The default session title is `Codex: <thread name>`, or `Codex: <directory>`
-for an unnamed thread. Run `!codex-rc My Project` to set a name that survives
-reconnects. A new session includes up to 30 turns of history. A session you
-reconnect catches up on the turns you ran in the terminal meanwhile.
-
-You can close the Codex terminal and keep working from Claude. To rejoin from
-the terminal, use `codex resume`. Both show the same thread, and you can answer
-an approval in either one.
-
-Run `!codex-rc --stop` inside Codex to disconnect. Running `!codex-rc` again
-reopens the same Remote Control session and prints its link. Archiving the
-session in Claude stops the bridge. The next connection creates a new session.
-
-### From a shell
-
-`codex-rc` runs in the foreground until you press Ctrl-C.
+Needs [Codex CLI](https://github.com/openai/codex) 0.170+ and Claude Code on the
+same machine, signed in (`claude`, then `/login`).
 
 ```sh
-codex-rc --last                  # Use this directory's most recent thread
-codex-rc --thread <thread-id>    # Use a specific thread
-codex-rc                         # Start a thread in this directory
-codex-rc -C ~/project My Project # Start a named session in another directory
+# Install
+uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control
+
+# At the Codex prompt
+!codex-rc
 ```
 
-The command prints the session URL and the `codex resume` command for the thread.
-Use `-m MODEL` to choose a model for a new thread or `-v` for verbose logs.
+Open the link it prints, or pick the session under **Remote Control** in Claude.
 
-`codex-rc --list` shows the threads on Remote Control from this machine.
-`codex-rc --stop` stops the only one, or the one you name with `--thread <thread-id>`.
+## Features
 
-## Controls in Claude
+- Prompts from your phone, desktop or browser; steer or stop a running turn
+- Commands, edits and approval requests in the chat
+- Changes and Files panels, `@` file mentions, attachments, `/btw` side questions
+- Model, reasoning effort, compaction and review as slash commands
+- Terminal and Claude on the same thread at once
 
-Send another message during a turn to steer it. **Stop** interrupts the turn,
-though a shell command Codex already started can keep running. The context
-meter shows the thread's token usage.
+## Installation
 
-Attach files to a message and Codex gets them as local files. Type `@` to
-mention a file from the thread's directory. The **Files** panel browses and
-opens them, and the **Changes** panel shows the working tree's diff when the
-directory is a checkout of a GitHub repository.
+**uv:** `uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control`
 
-An approval request appears as a card with **Deny** and **Allow once**. A
-command's card also offers **Always allow**, which approves that exact command
-for as long as the thread stays on Remote Control.
+**pipx:** `pipx install git+https://github.com/ThatCrispyToast/codex-remote-control`
 
-The model picker lists Claude models and shows “Unsupported model” for Codex.
-Type these in the chat box instead. The app's own `/usage` card shows your
-Claude plan's limits, so `/codex` shows Codex's.
+**Codex can't find `codex-rc`:** `uv tool update-shell`. A `!` command gets your
+login shell's PATH.
+
+## Usage
+
+```sh
+# In Codex
+!codex-rc                              # put this session on Remote Control
+!codex-rc My Project                   # same, under a name that survives reconnects
+!codex-rc --stop                       # take it off; !codex-rc reopens the same session
+
+# From a shell: prints the session link, runs until Ctrl-C
+codex-rc                               # new thread in this directory
+codex-rc --last                        # this directory's most recent thread
+codex-rc --thread <thread-id>          # a specific thread
+codex-rc -C ~/project My Project       # new thread in another directory, named
+codex-rc -m <model>                    # new thread on that model
+codex-rc -v                            # log what crosses the bridge
+
+# Either
+codex-rc --list                        # threads on Remote Control from this machine
+codex-rc --stop                        # stop the only one
+codex-rc --stop --thread <thread-id>   # stop that one
+```
+
+- A new session starts with the thread's last 30 turns.
+- Closing the terminal leaves the session up. `codex resume` rejoins it.
+- Archiving the session in Claude stops the bridge.
+
+### In Claude
+
+Typed in the chat box:
 
 | Command | Action |
 | --- | --- |
@@ -83,55 +72,63 @@ Claude plan's limits, so `/codex` shows Codex's.
 | `/effort [level]` | Show or change reasoning effort |
 | `/compact` | Compact the thread's context |
 | `/review [instructions]` | Review the uncommitted changes, or what you describe |
-| `/codex` | Show the Codex model and the others on offer, sandbox, context, usage limits and thread id |
-| `/sandbox` | Show the sandbox and approval settings |
 | `/btw <question>` | Ask a side question without adding to the thread |
+| `/codex` | Show model, sandbox, context, Codex usage limits and thread id |
+| `/sandbox` | Show the sandbox and approval settings |
 
-Other slash commands the app passes along are answered with this list. They
-are never sent to the model as a prompt.
-
-The mode menu starts at the closest match to your Codex settings.
+The mode menu:
 
 | Claude mode | Codex behavior |
 | --- | --- |
 | Manual | Read-only. Asks before writing. |
 | Accept edits | Can edit the workspace. Asks before working outside it. |
-| Auto | Same workspace access. The Codex reviewer handles approval requests. |
+| Auto | Same workspace access. The Codex reviewer answers approval requests. |
 | Plan | Plans changes without editing files. |
 
-## Compatibility
+Approval cards offer **Deny** and **Allow once**. A command's card adds
+**Always allow**, for that exact command while the thread is on Remote Control.
 
-This is an unofficial integration. It uses Anthropic's private Remote Control
-protocol and the experimental Codex app-server API. Tested with Codex 0.170.0
-and claude.ai/code on 2026-11-18.
+## Limitations
 
-- **“Already has an active writer”** means the Codex session has its own
-  app-server. Start Codex without `-c`, `--enable`, `--disable` or `--search`
-  so the bridge can join it.
-- An MCP tool's request to run, and an MCP form made only of choices, appear
-  in Claude. Answer a form with text fields in the Codex terminal.
-- Rewind, file undo, forks, and adding MCP servers from Claude are unsupported.
-- `/review` and `/btw` use your Codex plan like any other turn.
-- If the Codex daemon restarts mid-turn, the bridge reconnects. The interrupted
-  turn ends with an error.
+- Unofficial. Uses Anthropic's private Remote Control protocol and the
+  experimental Codex app-server API. Tested with Codex 0.170.0 and
+  claude.ai/code on 2026-11-18.
+- A Codex started with `-c`, `--enable`, `--disable` or `--search` can't be
+  joined ("already has an active writer").
+- The model picker lists Claude models only and reads "Unsupported model".
+  Use `/model`.
+- **Stop** ends the turn, but a shell command already running can carry on.
+- **Changes** needs a checkout of a GitHub repository.
+- MCP forms with text fields have to be answered in the Codex terminal.
+- No rewind, file undo, forks, or adding MCP servers from Claude.
 
 ## Development
 
-The bridge connects the shared Codex app-server to a Remote Control worker
-from [claude-rc-api](https://github.com/ThatCrispyToast/claude-rc-api).
-[bridge.py](codex_remote_control/bridge.py) handles session events,
-[translate.py](codex_remote_control/translate.py) turns Codex commands, edits,
-and approval requests into Claude transcript entries and permission cards, and
-[workspace.py](codex_remote_control/workspace.py) answers the app's Changes and
-Files panels from the thread's directory.
-
-Each thread has one bridge. Its lock file, its background log and the files
-attached to its messages live under `$XDG_STATE_HOME/codex-remote-control/`,
-which defaults to `~/.local/state/codex-remote-control/`.
-
 ```sh
-git clone https://github.com/ThatCrispyToast/codex-remote-control
-cd codex-remote-control
-uv run --extra test pytest -q
-uv run codex-rc --help
+git clone https://github.com/ThatCrispyToast/codex-remote-control && cd codex-remote-control
+uv run --extra test pytest -q   # offline, a couple of seconds
+uv run codex-rc --help          # the working tree's command
 ```
+
+### Layout
+
+| Path | Contents |
+| --- | --- |
+| `codex_remote_control/cli.py` | Command line; finds or creates a thread's session |
+| `codex_remote_control/appserver.py` | Client for Codex's shared app-server daemon |
+| `codex_remote_control/bridge.py` | Event loop between the thread and the session |
+| `codex_remote_control/translate.py` | Codex items, approvals and settings in Claude Code's terms |
+| `codex_remote_control/workspace.py` | Changes and Files panels, from the thread's directory |
+| `codex_remote_control/background.py` | Background bridges: lock records, logs, attached files |
+| `tests/` | Offline suite |
+
+The Claude side is a Remote Control worker from
+[claude-rc-api](https://github.com/ThatCrispyToast/claude-rc-api), pinned by
+commit. Bridge state lives in `$XDG_STATE_HOME/codex-remote-control/`
+(default `~/.local/state/codex-remote-control/`).
+
+Protocol notes and testing against the real services @ [AGENTS.md](AGENTS.md)
+
+## License
+
+MIT. Not affiliated with OpenAI or Anthropic.
