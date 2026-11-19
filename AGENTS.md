@@ -41,6 +41,14 @@ what neither the README nor the code will tell you.
   names its parent as `attachedToThreadId`. A temporary one is `ephemeral` and
   names none: `thread/read` answers while it is open, `thread/resume` finds
   "no rollout" and `thread/turns/list` refuses it.
+- `request_user_input_async` asks without stopping the turn. The question is
+  an `agentMessage` with `delivery: "async"` and `questions` (`title`,
+  `options` or null), whose text repeats them as lines. The answer is an
+  ordinary user message, a steer while the turn runs: compact JSON
+  `[{"answer","question","questionItemId"}]` between
+  `<send_user_message_question_reply>` markers, the id being
+  `["request_user_input_async","<message id>",<index>]`. Codex's TUI drops a
+  question when its turn ends and never asks one again from history.
 - `thread/settings/update` does not validate a model id, so the bridge checks
   one against `model/list` itself.
 - A thread nobody has written to yet is "not materialized": `thread/turns/list`
@@ -89,6 +97,8 @@ what neither the README nor the code will tell you.
   400 ("events: must contain no more than 100 item(s)"). A Codex turn left to
   work for hours holds a thousand items, so the bridge splits its uploads and
   backfills by items as well as turns.
+- An `AskUserQuestion` card always adds an "Other" box, and what is typed
+  there comes back in `answers` as the answer's text, as a label would.
 - `system/informational` is not drawn. A notice has to be an assistant
   message to be seen.
 - Answers that take time (`get_workspace_diff`, `file_suggestions`,

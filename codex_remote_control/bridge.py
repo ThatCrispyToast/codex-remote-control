@@ -137,6 +137,7 @@ class Bridge:
         self.last_turn: str | None = None  # the latest turn the thread has, running or not
         self.inputs: list[Event] = []  # the controller messages that turn answers
         self.queued: list[Event] = []  # controller messages waiting for it to end
+        self.replies: list[str] = []  # ... and answers to Codex's questions, from the app
         self.sent: set[str] = set()  # ids of the user messages this bridge submitted
         self.calls: dict[str, list[dict]] = {}  # running tool items' tool_use blocks, by item id
         self.interrupted: set[str] = set()  # tool items closed with their turn, whose real end is still to come
@@ -772,6 +773,8 @@ class Bridge:
             return  # written from the thread's history as the bridge attached
         if kind == "userMessage" and item.get("clientId") in self.sent:
             return  # sent from the app, where it shows already. One typed at a TUI goes on.
+        if kind == "userMessage":
+            self._questions_answered(item)
         if item["id"] in self.interrupted:
             self.interrupted.discard(item["id"])  # closed with its turn already
             return
@@ -799,6 +802,9 @@ class Bridge:
             self._send(*events)
         if written_live:
             self._stream_stop()
+        if kind == "agentMessage":
+            for question in translate.async_questions(item):
+                self._ask(question)
 
     def _message_delta(self, params: dict) -> None:
         self._stream_add(params["itemId"], "text", params["delta"])
@@ -912,9 +918,12 @@ class Bridge:
         self.turn, self.inputs, self.calls = None, [], {}
         self.stream, self.stream_open, self.stream_text = None, False, ""
         self.asked_to_compact = self.own_prompt = False
+        replies, self.replies = self.replies, []
         if self.queued:
             queued, self.queued = self.queued, []
             self._start_turn(queued)
+        for text in replies:
+            self._reply(text)
 
     def _thread_closed(self, params: dict) -> None:
         raise ThreadClosed(self.thread_id)
@@ -975,6 +984,40 @@ class Bridge:
             notice = f"Codex is waiting on a form from the MCP server {params['serverName']}. Answer it in the Codex TUI, or interrupt."
             self._send(worker_assistant(notice, model=self.model))
 
+    def _ask(self, question: dict) -> None:
+        """Put a question Codex asked as it works (`request_user_input_async`)
+        to the controllers, as a card like a prompt's. It is no request of the
+        app-server's: the answer goes back as a message, as from Codex's own
+        terminal, and as there the question goes when its turn ends."""
+        self._prompt({"id": None, "method": "question", "params": {**question, "itemId": question["id"]}},
+                     "AskUserQuestion", question["input"], "Codex has a question")
+
+    def _questions_answered(self, item: dict) -> None:
+        """A message that answers Codex's questions, sent from anywhere: their
+        cards come down. An older client names the message that asked."""
+        answered = {
+            reply["questionItemId"] for part in item["content"] if part.get("type") == "text"
+            for reply in translate.question_replies(part["text"]) or []
+        }
+        for request_id, request in list(self.prompts.items()):
+            if request["method"] == "question" and answered & {request["params"]["id"], request["params"]["message"]}:
+                self._withdraw_prompt(request_id)
+
+    def _reply(self, text: str) -> None:
+        """Give Codex a question's answer, as its own terminal does: a message
+        to the running turn. If that won't take it (it has just ended), the
+        answer starts the next turn."""
+        message = [{"type": "text", "text": text, "text_elements": []}]
+        if self.turn is not None:
+            try:
+                self.codex.request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self.turn, "input": message})
+            except AppServerError:
+                self.replies.append(text)
+            return
+        turn = self.codex.request("turn/start", {"threadId": self.thread_id, "input": message})["turn"]
+        self._turn_began(turn["id"])
+        self.worker.report_state("running")
+
     def _prompt(self, request: dict, tool: str, tool_input: dict, description: str, command: str | None = None) -> None:
         """Put one of Codex's requests to the controllers. A command's card
         also offers "Always allow"."""
@@ -1001,6 +1044,15 @@ class Bridge:
         decision: dict[str, Any] = (answer.payload.get("response") or {}).get("response") or {}
         log.debug("answered: %.600s", decision)
         allow = decision.get("behavior") == "allow"
+        if request["method"] == "question":
+            question = request["params"]
+            given = ((decision.get("updatedInput") or {}).get("answers") or {}).get(question["question"]) if allow else None
+            if isinstance(given, list):
+                given = ", ".join(given)
+            if given:  # dismissed, it stays Codex's to wait on
+                self._reply(translate.question_reply(question["id"], question["question"], given))
+            self._prompt_settled()
+            return
         if request["prompt"][0] == "AskUserQuestion":
             answers = (decision.get("updatedInput") or {}).get("answers") or {}
             if request["method"] == "item/tool/requestUserInput":

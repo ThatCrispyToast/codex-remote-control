@@ -319,6 +319,62 @@ def test_a_question_is_asked_and_answered_by_id(bridge):
     assert bridge.codex.answers == [(3, {"answers": {"q1": {"answers": ["Go"]}}})]
 
 
+ASKED = {"type": "agentMessage", "id": "call_ask1", "text": "Hands clear?\n- Yes", "phase": "final_answer",
+         "delivery": "async", "questions": [{"title": "Hands clear?", "options": ["Yes"]}]}
+REPLY = (
+    '<send_user_message_question_reply>\n'
+    '[{"answer":"Yes","question":"Hands clear?","questionItemId":"[\\"request_user_input_async\\",\\"call_ask1\\",0]"}]\n'
+    '</send_user_message_question_reply>'
+)
+
+
+def replied(text=REPLY, **fields):
+    """Codex's account of a message that answers its question."""
+    return item("completed", type="userMessage", id="u-9", clientId=None, content=[{"type": "text", "text": text}], **fields)
+
+
+def test_a_question_codex_asks_as_it_works_is_answered_in_the_app_by_a_message(bridge):
+    bridge._from_controller(user("go"))
+    bridge._from_codex(item("completed", **ASKED))
+    tool, asked, _ = bridge.worker.calls("prompt")[0]
+    assert (tool, asked["questions"][0]["question"]) == ("AskUserQuestion", "Hands clear?")
+    bridge._from_controller(answer("prompt-1", behavior="allow", updatedInput={"answers": {"Hands clear?": "Yes"}}))
+    assert bridge.codex.sent("turn/steer")[-1] == {
+        "threadId": THREAD, "expectedTurnId": "turn-1", "input": [{"type": "text", "text": REPLY, "text_elements": []}]}
+    assert bridge.codex.answers == []  # nothing of the app-server's own was waiting
+    bridge._from_codex(replied())  # Codex's account of it, which the transcript shows plainly
+    assert bridge.worker.events()[-1]["message"]["content"] == "> Hands clear?\n\nYes"
+
+
+def test_a_question_answered_at_a_tui_or_dismissed_is_left_to_codex(bridge):
+    bridge._from_controller(user("go"))
+    bridge._from_codex(item("completed", **ASKED))
+    bridge._from_codex(replied())  # answered at the TUI: the card comes down
+    assert bridge.worker.events()[-2]["type"] == "control_cancel_request" and bridge.prompts == {}
+    bridge._from_codex(item("completed", **{**ASKED, "id": "call_ask2"}))
+    bridge._from_controller(answer("prompt-2", seq=10, behavior="allow", updatedInput={"answers": {}}))
+    assert bridge.codex.sent("turn/steer") == [] and bridge.prompts == {}
+
+
+def test_an_answer_the_turn_ends_before_starts_the_next_turn(bridge):
+    bridge._from_controller(user("go"))
+    bridge._from_codex(item("completed", **ASKED))
+    bridge.codex.refuse.add("turn/steer")
+    bridge._from_controller(answer("prompt-1", behavior="allow", updatedInput={"answers": {"Hands clear?": "Yes"}}))
+    assert len(bridge.codex.sent("turn/start")) == 1
+    bridge._from_codex(turn_done())
+    assert bridge.codex.sent("turn/start")[-1]["input"] == [{"type": "text", "text": REPLY, "text_elements": []}]
+    assert bridge.turn == "turn-1"
+
+
+def test_a_question_in_the_threads_history_is_shown_and_not_asked_again(bridge):
+    told = {"type": "userMessage", "id": "u-9", "clientId": None, "content": [{"type": "text", "text": REPLY}]}
+    bridge.codex.results["thread/turns/list"] = {"data": [{**turn(1), "items": [*turn(1)["items"], ASKED, told]}]}
+    bridge.backfill(new=True)
+    assert bridge.worker.calls("prompt") == []
+    assert [e["message"]["content"] for e in bridge.worker.events() if e["type"] == "user"] == ["q1", "> Hands clear?\n\nYes"]
+
+
 def test_always_allow_lasts_for_the_session_and_covers_that_command(bridge):
     bridge._from_controller(user("clean up"))
     bridge._from_codex(approval())

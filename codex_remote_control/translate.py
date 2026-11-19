@@ -257,7 +257,8 @@ def typed(content: list[dict]) -> str:
     for part in content:
         kind = part.get("type")
         if kind == "text":
-            lines.append(part["text"])
+            replies = question_replies(part["text"])
+            lines.append(part["text"] if replies is None else "\n\n".join(f"> {r['question']}\n\n{r['answer']}" for r in replies))
         elif kind in ("image", "localImage"):
             lines.append(f"[image: {part['path']}]" if part.get("path") else "[image]")
         elif kind in ("mention", "skill"):
@@ -415,6 +416,58 @@ def question_answers(questions: list[dict], answers: dict) -> dict:
         answer = answers.get(q["question"])
         out[q["id"]] = {"answers": [] if answer is None else answer if isinstance(answer, list) else [answer]}
     return {"answers": out}
+
+
+# -- Codex asking while it works -------------------------------------------------
+# What an answer to one of those questions is wrapped in, as Codex writes it.
+_REPLY = ("<send_user_message_question_reply>", "</send_user_message_question_reply>")
+
+
+def async_questions(item: dict) -> list[dict]:
+    """The questions an agent message asks with `request_user_input_async`.
+    Codex works on while it waits, and takes the answer as a message. Each
+    comes with its id, as an answer names it, and the `AskUserQuestion` input
+    that puts it to the app, whose card adds a box for any other answer."""
+    return [
+        {
+            "id": json.dumps(["request_user_input_async", item["id"], index], separators=(",", ":")),
+            "message": item["id"],
+            "question": q["title"],
+            "input": {"questions": [{
+                "question": q["title"], "header": "Question", "multiSelect": False,
+                "options": [{"label": option, "description": ""} for option in q.get("options") or []],
+            }]},
+        }
+        for index, q in enumerate(item.get("questions") or [])
+    ]
+
+
+def question_reply(question_id: str, question: str, answer: str) -> str:
+    """The message that answers one of those questions, as Codex's own
+    terminal writes it: the question cut to 512 bytes on one line, then the
+    answer, wrapped in the markers Codex knows it by."""
+    question = question.encode()[:512].decode(errors="ignore").replace("\n", " ").replace("\r", " ")
+    if len(question_id) > 512:  # Codex's own fallback: the plain form
+        return f"> {question}\n\n{answer}"
+    replies = [{"answer": answer, "question": question, "questionItemId": question_id}]
+    return f"{_REPLY[0]}\n{json.dumps(replies, ensure_ascii=False, separators=(',', ':'))}\n{_REPLY[1]}"
+
+
+def question_replies(text: str) -> list[dict] | None:
+    """The answers to Codex's questions a message gives, if that is all it
+    is: each one's `answer`, `question` and `questionItemId`."""
+    text = text.strip()
+    if not (text.startswith(_REPLY[0]) and text.endswith(_REPLY[1])):
+        return None
+    try:
+        replies = json.loads(text[len(_REPLY[0]):-len(_REPLY[1])])
+    except ValueError:
+        return None
+    replies = replies if isinstance(replies, list) else [replies]
+    fields = ("answer", "question", "questionItemId")
+    if not replies or not all(isinstance(r, dict) and all(isinstance(r.get(f), str) for f in fields) for r in replies):
+        return None
+    return replies
 
 
 # -- what the session says about itself ------------------------------------------

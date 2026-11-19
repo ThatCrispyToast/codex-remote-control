@@ -266,6 +266,40 @@ def test_questions_go_out_as_ask_user_question_and_come_back_by_id():
 
 
 # -- usage ------------------------------------------------------------------------
+# What Codex's terminal sends for the answer "Yes" to a question its message call_ask1 asked.
+REPLY = (
+    '<send_user_message_question_reply>\n'
+    '[{"answer":"Yes","question":"Hands clear?","questionItemId":"[\\"request_user_input_async\\",\\"call_ask1\\",0]"}]\n'
+    '</send_user_message_question_reply>'
+)
+
+
+def test_a_question_asked_while_codex_works_is_a_card_with_its_options():
+    asked = {"type": "agentMessage", "id": "call_ask1", "text": "Hands clear?\n- Yes", "delivery": "async",
+             "questions": [{"title": "Hands clear?", "options": ["Yes"]}, {"title": "Anything else?", "options": None}]}
+    first, second = translate.async_questions(asked)
+    assert first["id"] == '["request_user_input_async","call_ask1",0]' and first["question"] == "Hands clear?"
+    assert first["input"]["questions"][0]["options"] == [{"label": "Yes", "description": ""}]
+    assert second["input"]["questions"][0]["options"] == []  # the card's own box takes any answer
+    assert translate.async_questions({"type": "agentMessage", "id": "m", "text": "hi"}) == []
+
+
+def test_an_answer_is_written_as_codexs_terminal_writes_it():
+    assert translate.question_reply('["request_user_input_async","call_ask1",0]', "Hands clear?", "Yes") == REPLY
+    long = translate.question_replies(translate.question_reply("q", "Line one\nline two " + "é" * 400, "ok"))[0]
+    assert "\n" not in long["question"] and len(long["question"].encode()) <= 512  # cut on a character
+    assert translate.question_reply("q" * 513, "Hands clear?", "Yes") == "> Hands clear?\n\nYes"
+
+
+def test_an_answer_shows_as_its_question_quoted_above_it():
+    assert translate.question_replies(REPLY) == [
+        {"answer": "Yes", "question": "Hands clear?", "questionItemId": '["request_user_input_async","call_ask1",0]'}]
+    assert translate.typed([{"type": "text", "text": REPLY}]) == "> Hands clear?\n\nYes"
+    for text in ("Yes", "<send_user_message_question_reply>\nnot json\n</send_user_message_question_reply>",
+                 "<send_user_message_question_reply>\n[]\n</send_user_message_question_reply>"):
+        assert translate.question_replies(text) is None and translate.typed([{"type": "text", "text": text}]) == text
+
+
 def test_a_turns_usage_is_the_growth_of_the_threads_total():
     before = {"total": {"inputTokens": 100, "cachedInputTokens": 60, "cacheWriteInputTokens": 0, "outputTokens": 10}}
     after = {"total": {"inputTokens": 350, "cachedInputTokens": 260, "cacheWriteInputTokens": 5, "outputTokens": 40}}

@@ -22,7 +22,8 @@ Open the link it prints, or pick the session under **Remote Control** in Claude.
 ## Features
 
 - Prompts from your phone, desktop or browser; steer or stop a running turn
-- Commands, edits and approval requests in the chat
+- Commands, edits and approval requests in the chat, and Codex's questions to
+  answer there
 - Changes and Files panels, `@` file mentions, attachments, `/btw` side questions
 - Model, reasoning effort, compaction and review as slash commands
 - Terminal and Claude on the same thread at once
