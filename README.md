@@ -12,8 +12,9 @@ same machine, signed in (`claude`, then `/login`).
 ```sh
 # Install
 uv tool install git+https://github.com/ThatCrispyToast/codex-remote-control
-
-# At the Codex prompt
+```
+```sh
+# In Codex
 !codex-rc "optional-session-name"
 ```
 
