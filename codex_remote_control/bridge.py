@@ -50,6 +50,14 @@ log = logging.getLogger(__name__)
 _RECONNECT_TRIES = 8
 # How often a reply that is still being written is passed on to its watchers.
 _STREAM_FLUSH_S = 0.3
+# How long a running turn is quiet before the app is told the model is
+# thinking. Codex says nothing while its model thinks: a thought is reported
+# when it is over, so the quiet is all there is to go on.
+_THINK_AFTER_S = 1.0
+# How often the app is told again of a compaction still running, as Claude Code
+# tells it. One it did not ask for, it takes to be over 75 seconds after the
+# last word of it.
+_COMPACTING_EVERY_S = 30.0
 # What a tool call and a turn still open when the bridge is stopped end as.
 _LEFT = "Remote Control was stopped before this finished."
 # How much of a thread's history a session is given, to start with or to catch
@@ -141,9 +149,12 @@ class Bridge:
         self.sent: set[str] = set()  # ids of the user messages this bridge submitted
         self.calls: dict[str, list[dict]] = {}  # running tool items' tool_use blocks, by item id
         self.interrupted: set[str] = set()  # tool items closed with their turn, whose real end is still to come
+        self.busy: set[str] = set()  # the running turn's items in progress, the model's thoughts apart
+        self.answered = False  # ... and whether its answer is in: what is left of the turn is Codex's own
         self.backfilled: set[str] = set()  # turns written from the thread's history, see backfill()
         self.written: set[str] = set()  # ... and the finished items of the turn running then
-        self.compacting_from: dict | None = None  # the usage as a compaction began
+        self.compacting: float | None = None  # when the app was last told of the compaction now running
+        self.compacting_from: dict | None = None  # ... and the usage as it began
         self.asked_to_compact = False  # /compact was typed: the next compaction is not Codex's own
         self.own_prompt = False  # the running turn was started by a command: its prompt is Codex's wording, not the user's
         self.review: str | None = None  # a review's findings, until the message that repeats them arrives
@@ -158,6 +169,8 @@ class Bridge:
         self.stream_open = False  # ... whether the watchers have its start
         self.stream_text = ""  # ... and its text not yet passed on to them
         self.stream_sent_at = 0.0
+        self.thought: str | None = None  # the empty thought watchers see while the model thinks, by its id
+        self.heard_at = 0.0  # when Codex or a controller last had something for the bridge
         self._inbox: queue.Queue = queue.Queue()
 
     # -- the loop ------------------------------------------------------------
@@ -190,17 +203,22 @@ class Bridge:
 
     def _serve(self) -> None:
         while True:
+            now, waiting = time.monotonic(), self._clock()
+            due = [act for when, act in waiting if when <= now]
             try:
-                source, item = self._inbox.get(timeout=_STREAM_FLUSH_S if self.stream_text else None)
+                wait = min((when - now for when, _ in waiting), default=None)
+                source, item = ("clock", due) if due else self._inbox.get(timeout=wait)
             except queue.Empty:
-                self._stream_flush()
                 continue
             if isinstance(item, AppServerClosed):
                 return
             if isinstance(item, Exception):
                 raise item
             try:
-                if source == "task":
+                if source == "clock":
+                    for act in item:
+                        act()
+                elif source == "task":
                     item()
                 elif source == "rc":
                     self._from_controller(item)
@@ -214,6 +232,19 @@ class Bridge:
                 # One event that can't be passed on (a refused upload, a shape
                 # this version doesn't know) is no reason to drop the session.
                 log.exception("could not handle %s", item.get("method") if source == "codex" else item)
+
+    def _clock(self) -> list[tuple[float, Callable[[], None]]]:
+        """What the bridge does unprompted, each with when it is due: pass on
+        the pieces of a reply it is holding, say that a turn gone quiet is
+        the model thinking, and say again that a compaction is running."""
+        waiting: list[tuple[float, Callable[[], None]]] = []
+        if self.stream_text:
+            waiting.append((self.stream_sent_at + _STREAM_FLUSH_S, self._stream_flush))
+        if self.thought is None and self.watched and self._quiet():
+            waiting.append((self.heard_at + _THINK_AFTER_S, self._think))
+        if self.compacting is not None:
+            waiting.append((self.compacting + _COMPACTING_EVERY_S, self._compacting))
+        return waiting
 
     def _later(self, request: Event, work: Callable[[], dict]) -> None:
         """Answer a control request with what ``work`` returns, worked out off
@@ -316,10 +347,10 @@ class Bridge:
     def _write_running(self, turn: dict) -> None:
         """Write the running turn as far as it has got: what has finished, and
         the tool calls still open, which their own end then closes. A message
-        or a thought at its end may still be being written, and arrives
-        finished."""
+        or a thought at its end that Codex does not say is finished may still
+        be being written, and arrives finished."""
         items = turn["items"]
-        if items and items[-1]["type"] in ("agentMessage", "reasoning", "plan"):
+        if items and items[-1]["type"] in ("agentMessage", "reasoning", "plan") and items[-1].get("completedAtMs") is None:
             items = items[:-1]
         events = []
         for item in items:
@@ -354,7 +385,9 @@ class Bridge:
 
     def _send(self, *payloads: dict) -> None:
         """Write transcript events, in as many uploads as claude.ai needs, and
-        note whether anyone is watching."""
+        note whether anyone is watching. With something to write, the model
+        is no longer just thinking."""
+        self._hush()
         for start in range(0, len(payloads), _UPLOAD_EVENTS):
             self.watched = self.worker.send(*payloads[start:start + _UPLOAD_EVENTS]).get("has_subscribers", True)
 
@@ -409,9 +442,15 @@ class Bridge:
 
     def _note(self, text: str) -> None:
         """Say something in the transcript that no message asked for."""
-        self._send(worker_assistant(text, model=self.model, stop_reason="end_turn"))
+        self._send(self._aside(text))
         if self.turn is None:  # a running turn's own result is still to come
             self._send(worker_result(result=text, num_turns=0))
+
+    def _aside(self, text: str) -> dict:
+        """A message of the bridge's own. It is the end of a turn only when
+        none is running: said as one in the middle of Codex's, it would have
+        the app take that turn's work to be over."""
+        return worker_assistant(text, model=self.model, stop_reason="end_turn" if self.turn is None else None)
 
     def _settings_updated(self, params: dict) -> None:
         """The thread's settings changed, here or at a TUI."""
@@ -428,6 +467,7 @@ class Bridge:
     # -- from the controllers ------------------------------------------------
     def _from_controller(self, event: Event) -> None:
         log.debug("claude.ai: %r %.600s", event, event.payload.get("request") or "")
+        self.heard_at = time.monotonic()
         if event.type == "user":
             self._user_message(event)
         elif event.type == "control_request":
@@ -512,7 +552,7 @@ class Bridge:
         """Answer a message without a Codex turn, as Claude Code answers a
         slash command."""
         self.worker.report_delivery(message, "processing")
-        self._send(worker_assistant(answer, model=self.model, stop_reason="end_turn"))
+        self._send(self._aside(answer))
         if self.turn is None:
             self.worker.end_turn(message, result=answer, num_turns=0)
         else:  # mid-turn: the running turn's result is still to come
@@ -611,6 +651,8 @@ class Bridge:
             pending_permission_requests=[self._prompt_payload(rid) for rid in self.prompts],
             pending_user_dialog_requests=[],
         )
+        self.watched = True  # whatever the last upload was told
+        self._hush()  # shown again in a moment, to this controller too
         self._announce()
 
     def _interrupt(self, request: Event, _: dict) -> None:
@@ -734,6 +776,7 @@ class Bridge:
             return  # the daemon is shared: another thread's traffic
         if (params.get("turnId") or (params.get("turn") or {}).get("id")) in self.backfilled:
             return  # in the transcript already
+        self.heard_at = time.monotonic()
         if not message["method"].endswith(("elta", "/updated")):
             log.debug("codex: %s %s", message["method"], (params.get("item") or {}).get("type", ""))
         if "id" in message:
@@ -751,14 +794,18 @@ class Bridge:
         self.turn = turn_id
         self.usage_before = self.usage
         self.last_text = ""
+        self.busy, self.answered = set(self.calls), False  # the calls: those open in a turn taken up as it runs
 
     def _item_started(self, params: dict) -> None:
         item = params["item"]
         if item["id"] in self.written or item["id"] in self.calls:
             return  # written from the thread's history as the bridge attached
+        if item["type"] not in ("reasoning", "userMessage"):  # the model has got somewhere
+            self.busy.add(item["id"])
+            self._hush()
         if item["type"] == "contextCompaction":
             self.compacting_from = self.usage
-            self._send(worker_status("compacting"))
+            self._compacting()
             return
         if item["type"] == "webSearch":  # its query is known only once it is done
             return
@@ -769,6 +816,7 @@ class Bridge:
     def _item_completed(self, params: dict) -> None:
         item = params["item"]
         kind = item["type"]
+        self.busy.discard(item["id"])
         if item["id"] in self.written:
             return  # written from the thread's history as the bridge attached
         if kind == "userMessage" and item.get("clientId") in self.sent:
@@ -780,7 +828,9 @@ class Bridge:
             return
         if kind == "contextCompaction":
             trigger, self.asked_to_compact = "manual" if self.asked_to_compact else "auto", False
-            self._send(translate.compact_boundary(trigger, self.compacting_from), worker_status(None))
+            before, self.compacting, self.compacting_from = self.compacting_from, None, None
+            after = self.usage if self.usage is not before else None  # reported since, or not known
+            self._send(translate.compaction_over(True), translate.compact_boundary(trigger, before, after))
             self.last_text = "Context compacted."
             return
         if kind == "userMessage" and self.own_prompt:
@@ -793,6 +843,7 @@ class Bridge:
             events = events[1:]  # the call itself went out as it started
         if kind == "agentMessage":
             self.last_text = item["text"] or self.last_text
+            self.answered = translate.final(item)
             if item["text"] == self.review:
                 self.review = None
         written_live = kind in ("agentMessage", "reasoning") and self.stream == item["id"]
@@ -801,7 +852,7 @@ class Bridge:
         if events:
             self._send(*events)
         if written_live:
-            self._stream_stop()
+            self._stream_stop(answer=kind == "agentMessage" and self.answered)
         if kind == "agentMessage":
             for question in translate.async_questions(item):
                 self._ask(question)
@@ -823,6 +874,7 @@ class Bridge:
         if not self.watched:
             return
         if self.stream != item_id:
+            self._hush()
             if self.stream is not None:  # one that never finished: close it for its watchers
                 self._stream_flush(end=True)
                 self._stream_stop()
@@ -832,38 +884,58 @@ class Bridge:
             self._stream_flush()
 
     def _stream_flush(self, *, end: bool = False) -> None:
-        """Pass on the text gathered since the last flush, as the Messages
-        API's streaming events. ``end`` closes the block."""
+        """Pass on the text gathered since the last flush. ``end`` closes the
+        block. A piece that can't be passed on is dropped, not held."""
         thinking = self.stream_kind == "thinking"
         events = []
         if self.stream_text:
             if not self.stream_open:
                 self.stream_open = True
-                message = {
-                    "id": self.stream, "type": "message", "role": "assistant", "model": self.model, "content": [],
-                    "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0},
-                }
-                block = {"type": "thinking", "thinking": ""} if thinking else {"type": "text", "text": ""}
-                events.append({"type": "message_start", "message": message})
-                events.append({"type": "content_block_start", "index": 0, "content_block": block})
-            delta = (
-                {"type": "thinking_delta", "thinking": self.stream_text} if thinking
-                else {"type": "text_delta", "text": self.stream_text}
-            )
-            events.append({"type": "content_block_delta", "index": 0, "delta": delta})
+                events += translate.stream_start(self.stream, self.model, thinking)
+            events.append(translate.stream_text(self.stream_text, thinking))
         if end and self.stream_open:
-            events.append({"type": "content_block_stop", "index": 0})
+            events.append(translate.STREAM_BLOCK_END)
+        self.stream_text, self.stream_sent_at = "", time.monotonic()
+        self._live(*events)
+
+    def _stream_stop(self, *, answer: bool = False) -> None:
+        """End the message that was being written, for its watchers."""
+        was_open = self.stream_open
+        self.stream, self.stream_open, self.stream_text = None, False, ""
+        if was_open:
+            self._live(*translate.stream_end(answer))
+
+    def _live(self, *events: dict) -> None:
+        """Show the watchers a message as it is written. None of this is kept."""
         if events:
             self.worker.send(*map(worker_stream_event, events), ephemeral=True)
-        self.stream_text = ""
-        self.stream_sent_at = time.monotonic()
 
-    def _stream_stop(self) -> None:
-        """End the message that was being written, for its watchers."""
-        if self.stream_open:
-            stop = {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}}
-            self.worker.send(worker_stream_event(stop), worker_stream_event({"type": "message_stop"}), ephemeral=True)
-        self.stream, self.stream_open, self.stream_text = None, False, ""
+    # -- what Codex does not say: that its model is thinking, that it is still compacting --
+    def _quiet(self) -> bool:
+        """Whether the running turn is the model's alone: nothing in progress
+        or being written, nobody asked anything, and no answer given yet."""
+        return self.turn is not None and not (self.busy or self.stream or self.prompts or self.answered)
+
+    def _think(self) -> None:
+        """Show the model as thinking, as Claude Code shows Claude: a thought
+        begun and left empty, which the app draws as "Thinking" beside the
+        turn's clock. Codex reports a thought only once it is over, and many
+        never have a summary to show, so the bridge says it of a turn that
+        has gone quiet, until the turn has something else to show."""
+        self.thought = f"thought-{time.monotonic_ns()}"
+        self._live(*translate.stream_start(self.thought, self.model, thinking=True))
+
+    def _hush(self) -> None:
+        """End that thought, if one is showing."""
+        if self.thought is not None:
+            self.thought = None
+            self._live(translate.STREAM_BLOCK_END, *translate.stream_end())
+
+    def _compacting(self) -> None:
+        """Tell the app a compaction is running: as it begins, and again for
+        as long as it goes on."""
+        self.compacting = time.monotonic()
+        self._send(worker_status("compacting"))
 
     def _plan_updated(self, params: dict) -> None:
         call_id = f"plan-{params['turnId']}-{time.monotonic_ns()}"
@@ -889,6 +961,9 @@ class Bridge:
         if self.stream is not None:  # a message cut off as it was being written
             self._stream_flush(end=True)
             self._stream_stop()
+        self._hush()
+        if self.compacting is not None:  # a compaction cut off too
+            self._send(translate.compaction_over(False))
         if status == "failed":
             self.last_text = (turn.get("error") or {}).get("message") or "The turn failed."
             self._send(worker_assistant(self.last_text, model=self.model))
@@ -917,6 +992,7 @@ class Bridge:
             })
         self.turn, self.inputs, self.calls = None, [], {}
         self.stream, self.stream_open, self.stream_text = None, False, ""
+        self.compacting = self.compacting_from = None
         self.asked_to_compact = self.own_prompt = False
         replies, self.replies = self.replies, []
         if self.queued:
@@ -1023,6 +1099,7 @@ class Bridge:
         also offers "Always allow"."""
         suggestions = translate.session_rule(command) if command else None
         tool_use_id = request["params"].get("itemId") or f"request-{request['id']}"
+        self._hush()
         request_id = self.worker.request_permission(
             tool, tool_input, tool_use_id=tool_use_id, description=description, raw_command=command,
             permission_suggestions=suggestions,

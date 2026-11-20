@@ -132,6 +132,9 @@ def test_transcript_of_each_kind_of_item():
         {"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": "hi"}}]
     said = translate.transcript({"type": "agentMessage", "id": "msg_1", "text": "hello"}, "gpt-x")
     assert said[0]["message"]["id"] == "msg_1" and said[0]["message"]["content"] == [{"type": "text", "text": "hello"}]
+    assert said[0]["message"]["stop_reason"] is None  # Codex did not call it the answer
+    answer = translate.transcript({"type": "agentMessage", "id": "msg_1", "text": "hello", "phase": "final_answer"}, "gpt-x")
+    assert answer[0]["message"]["stop_reason"] == "end_turn"
     assert translate.transcript({"type": "agentMessage", "id": "msg_2", "text": ""}, "gpt-x") == []
     thought = translate.transcript({"type": "reasoning", "id": "r", "summary": ["a", "b"], "content": []}, "gpt-x")
     assert thought[0]["message"]["content"] == [{"type": "thinking", "thinking": "a\n\nb", "signature": ""}]

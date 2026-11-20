@@ -1,10 +1,13 @@
 """The bridge between a recorded Codex app-server and a recorded worker seat."""
+import threading
+import time
+
 import pytest
 from claude_rc import APIError, Event
 
 from codex_remote_control import bridge as bridge_module
 from codex_remote_control import workspace
-from codex_remote_control.appserver import AppServerError
+from codex_remote_control.appserver import AppServerClosed, AppServerError
 from codex_remote_control.bridge import Bridge, ThreadClosed, session_title
 
 THREAD = "thr-1"
@@ -130,6 +133,18 @@ def item(event, **fields):
 
 def turn_done(status="completed", **turn):
     return note("turn/completed", turn={"id": "turn-1", "status": status, "error": None, "durationMs": 1200, **turn})
+
+
+def later(bridge, seconds):
+    """Do what the bridge does unprompted once this long has passed with nothing to handle."""
+    for when, act in bridge._clock():
+        if when <= time.monotonic() + seconds:
+            act()
+
+
+def live(bridge):
+    """What the watchers were shown and the transcript does not keep."""
+    return [event["event"] for event in bridge.worker.events("ephemeral")]
 
 
 COMMAND = {"type": "commandExecution", "id": "exec-1", "command": "bash -lc 'ls'", "status": "inProgress"}
@@ -656,12 +671,14 @@ def test_compact_is_a_turn_of_the_command_that_asked(bridge):
     bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 900}}))
     bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
     bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
+    bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 200}}))  # what is left
     bridge._from_codex(item("completed", type="contextCompaction", id="c-1"))
     bridge._from_codex(turn_done())
     assert bridge.worker.events()[1:] == [
         {"type": "system", "subtype": "status", "status": "compacting"},
-        {"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual", "pre_tokens": 900}},
-        {"type": "system", "subtype": "status", "status": None}]
+        {"type": "system", "subtype": "status", "status": None, "compact_result": "success"},
+        {"type": "system", "subtype": "compact_boundary",
+         "compact_metadata": {"trigger": "manual", "pre_tokens": 900, "post_tokens": 200}}]
     ended = bridge.worker.calls("end_turn")[-1]
     assert ended[0] is again and (ended[-1]["result"], ended[-1]["codex_turn"]) == ("Context compacted.", "turn-1")
 
@@ -670,7 +687,31 @@ def test_a_compaction_of_codexs_own_is_marked_too(bridge):
     bridge._from_controller(user("go on"))
     bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
     bridge._from_codex(item("completed", type="contextCompaction", id="c-1"))
-    assert bridge.worker.events()[1]["compact_metadata"] == {"trigger": "auto"}
+    assert bridge.worker.events()[2]["compact_metadata"] == {"trigger": "auto"}  # Codex gave no sizes
+
+
+def test_the_app_is_told_again_of_a_compaction_that_goes_on(bridge):
+    said = {"type": "system", "subtype": "status", "status": "compacting"}
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))  # at a terminal: the app asked for nothing
+    bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
+    later(bridge, 20)
+    assert bridge.worker.events() == [said]
+    later(bridge, 40)  # the app would take it to be over at 75 seconds
+    assert bridge.worker.events() == [said, said]
+    later(bridge, 20)
+    assert bridge.worker.events() == [said, said] and live(bridge) == []  # nor is the model thinking meanwhile
+    bridge._from_codex(item("completed", type="contextCompaction", id="c-1"))
+    later(bridge, 600)
+    assert [event["subtype"] for event in bridge.worker.events()[2:]] == ["status", "compact_boundary"]
+
+
+def test_a_compaction_its_turn_ends_before_is_marked_as_failed(bridge):
+    bridge._from_controller(user("go on"))
+    bridge._from_codex(item("started", type="contextCompaction", id="c-1"))
+    bridge._from_codex(turn_done("interrupted"))
+    assert bridge.worker.events()[1] == {"type": "system", "subtype": "status", "status": None, "compact_result": "failed"}
+    later(bridge, 600)
+    assert len(bridge.worker.events()) == 2
 
 
 def test_review_runs_codexs_review_and_writes_its_findings_once(bridge):
@@ -709,6 +750,12 @@ def test_a_command_mid_turn_leaves_the_turn_running(bridge):
     bridge._from_controller(command)
     assert bridge.worker.calls("end_turn") == []
     assert bridge.worker.calls("report_delivery") == [(command, "processing", {}), (command, "processed", {})]
+    bridge._from_codex(note("warning", message="Usage is running low."))
+    assert [event["message"]["stop_reason"] for event in bridge.worker.events()] == [None, None]  # not the turn's end
+
+    bridge._from_codex(turn_done())
+    bridge._from_controller(user("/effort", uuid="u-3", seq=3))
+    assert bridge.worker.events()[-1]["message"]["stop_reason"] == "end_turn"
 
 
 # -- a reply as it is written -------------------------------------------------------------
@@ -742,7 +789,7 @@ def test_a_thought_is_streamed_as_thinking(bridge):
         bridge._from_codex(note("item/reasoning/summaryTextDelta", turnId="turn-1", itemId="rs_1", summaryIndex=index, delta=text))
     bridge._from_codex(item("completed", type="reasoning", id="rs_1", summary=["First.", "Then."], content=[]))
     live = [event["event"] for event in bridge.worker.events("ephemeral")]
-    assert live[1]["content_block"] == {"type": "thinking", "thinking": ""}
+    assert live[1]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
     assert "".join(e["delta"]["thinking"] for e in live if e["type"] == "content_block_delta") == "First.\n\nThen."
     (kept,) = bridge.worker.events()
     assert kept["message"]["id"] == "rs_1" == live[0]["message"]["id"]
@@ -767,6 +814,129 @@ def test_nothing_is_streamed_when_nobody_is_watching(bridge):
     bridge._from_codex(item("completed", type="agentMessage", id="msg_1", text="Hello"))
     assert bridge.worker.events("ephemeral") == []
     assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "Hello"
+
+
+def test_only_the_answer_ends_as_the_end_of_the_turn(bridge):
+    bridge._from_controller(user("fix it"))
+    for phase in ("commentary", "final_answer"):
+        bridge._from_codex(delta(phase))
+        bridge._from_codex(item("completed", type="agentMessage", id="msg_1", text=phase, phase=phase))
+    on_the_way, answer = bridge.worker.events()
+    assert (on_the_way["message"]["stop_reason"], answer["message"]["stop_reason"]) == (None, "end_turn")
+    ends = [event["delta"]["stop_reason"] for event in live(bridge) if event["type"] == "message_delta"]
+    assert ends == [None, "end_turn"]
+
+
+# -- what Codex does not say: that its model is thinking -------------------------------------
+THOUGHT_ENDS = ["content_block_stop", "message_delta", "message_stop"]
+
+
+def test_a_turn_gone_quiet_shows_the_model_thinking(bridge):
+    bridge._from_controller(user("work it out"))
+    later(bridge, 0.5)
+    assert live(bridge) == []  # an answer that comes at once needs no word of it
+    later(bridge, 2)
+    begun, block = live(bridge)
+    assert begun["type"] == "message_start"
+    assert block == {"type": "content_block_start", "index": 0,
+                     "content_block": {"type": "thinking", "thinking": "", "signature": ""}}
+    later(bridge, 60)
+    assert len(live(bridge)) == 2  # said once
+
+    # Codex reports the thought as it ends, with nothing to show: the model is still at it.
+    bridge._from_codex(item("started", type="reasoning", id="rs_1", summary=[], content=[]))
+    bridge._from_codex(item("completed", type="reasoning", id="rs_1", summary=[], content=[]))
+    assert len(live(bridge)) == 2 and bridge.worker.events() == []
+
+    bridge._from_codex(item("started", **COMMAND))  # something to show: the thought ends first
+    assert [event["type"] for event in live(bridge)[2:]] == THOUGHT_ENDS
+    assert live(bridge)[3]["delta"]["stop_reason"] is None
+    assert [entry[0] for entry in bridge.worker.log if entry[0] in ("event", "ephemeral")] == ["ephemeral"] * 5 + ["event"]
+    later(bridge, 60)
+    assert len(live(bridge)) == 5  # a command is running: the model waits on it
+
+    bridge._from_codex(item("completed", **{**COMMAND, "status": "completed", "aggregatedOutput": "", "exitCode": 0}))
+    later(bridge, 2)
+    again = live(bridge)[5]
+    assert again["type"] == "message_start" and again["message"]["id"] != begun["message"]["id"]
+
+
+def test_a_thought_codex_does_report_takes_the_place_of_the_empty_one(bridge):
+    bridge._from_controller(user("think"))
+    later(bridge, 2)
+    bridge._from_codex(note("item/reasoning/summaryTextDelta", turnId="turn-1", itemId="rs_1", summaryIndex=0, delta="First."))
+    kinds = [event["type"] for event in live(bridge)]
+    assert kinds == ["message_start", "content_block_start", *THOUGHT_ENDS,
+                     "message_start", "content_block_start", "content_block_delta"]
+    assert live(bridge)[5]["message"]["id"] == "rs_1"
+    later(bridge, 60)
+    assert len(live(bridge)) == 8  # being written: nothing to add
+
+
+def test_the_model_is_not_thinking_while_someone_is_asked_or_once_it_has_answered(bridge):
+    bridge._from_controller(user("clean up"))
+    later(bridge, 2)
+    bridge._from_codex(approval())
+    assert [event["type"] for event in live(bridge)[2:]] == THOUGHT_ENDS
+    later(bridge, 60)
+    assert len(live(bridge)) == 5  # the turn waits on the answer
+
+    bridge._from_controller(answer("prompt-1", behavior="allow"))
+    later(bridge, 2)
+    assert len(live(bridge)) == 7
+
+    bridge._from_codex(item("completed", type="agentMessage", id="msg_1", text="Done.", phase="final_answer"))
+    assert [event["type"] for event in live(bridge)[7:]] == THOUGHT_ENDS
+    later(bridge, 60)
+    assert len(live(bridge)) == 10  # what is left of the turn is Codex's own
+
+    bridge._from_codex(turn_done())
+    later(bridge, 60)
+    assert len(live(bridge)) == 10 and bridge.thought is None
+
+
+def test_a_turn_that_ends_takes_the_thought_with_it(bridge):
+    bridge._from_controller(user("work"))
+    later(bridge, 2)
+    bridge._from_codex(turn_done("interrupted"))
+    assert [event["type"] for event in live(bridge)[2:]] == THOUGHT_ENDS
+    assert [entry[0] for entry in bridge.worker.log if entry[0] in ("ephemeral", "end_turn")] == ["ephemeral"] * 5 + ["end_turn"]
+
+
+def test_nobody_watching_is_shown_no_thought_and_a_controller_attaching_is(bridge):
+    bridge.worker.watched = False
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
+    bridge._from_codex(item("completed", type="userMessage", id="i-1", clientId=None, content=[]))  # its upload's ack
+    later(bridge, 60)
+    assert live(bridge) == []
+
+    bridge._from_controller(control("initialize"))
+    later(bridge, 2)
+    assert [event["type"] for event in live(bridge)] == ["message_start", "content_block_start"]
+
+    bridge._from_controller(control("initialize", seq=2))  # another: it missed the thought's start
+    later(bridge, 2)
+    assert [event["type"] for event in live(bridge)[2:]] == [*THOUGHT_ENDS, "message_start", "content_block_start"]
+
+
+def test_a_turn_taken_up_as_a_command_runs_is_not_the_model_thinking(bridge):
+    running = {"id": "turn-1", "status": "inProgress", "items": [COMMAND]}
+    bridge.codex.results["thread/turns/list"] = {"data": [running]}
+    bridge.backfill(new=True)
+    bridge._adopt_running_turn()
+    later(bridge, 60)
+    assert live(bridge) == []
+    bridge._from_codex(item("completed", **{**COMMAND, "status": "completed", "aggregatedOutput": "", "exitCode": 0}))
+    later(bridge, 2)
+    assert [event["type"] for event in live(bridge)] == ["message_start", "content_block_start"]
+
+
+def test_the_loop_acts_on_the_clock_between_what_it_is_sent(bridge, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_THINK_AFTER_S", 0.05)
+    bridge._inbox.put(("codex", note("turn/started", turn={"id": "turn-1"})))
+    threading.Timer(0.5, bridge._inbox.put, [("codex", AppServerClosed("gone"))]).start()
+    bridge._serve()  # until the connection drops
+    assert [event["type"] for event in live(bridge)] == ["message_start", "content_block_start"]  # once, not in a spin
 
 
 # -- the rest -----------------------------------------------------------------------------
@@ -894,6 +1064,16 @@ def test_a_turn_running_as_the_bridge_attaches_is_written_as_far_as_it_got(bridg
     closed, said = bridge.worker.events()[4:]
     assert closed["message"]["content"][0] == {"type": "tool_result", "tool_use_id": "exec-1", "content": "b", "is_error": False}
     assert said["message"]["content"][0]["text"] == "Look: b"
+
+
+def test_a_running_turns_last_message_is_written_if_it_is_finished(bridge):
+    said = {"type": "agentMessage", "id": "msg_2", "text": "I'll run the tests.", "completedAtMs": 1795200000000}
+    bridge.codex.results["thread/turns/list"] = {"data": [{"id": "t2", "status": "inProgress", "items": [said]}]}
+    bridge.backfill(new=True)  # the model is thinking, or writing out a call: no word of this message is to come
+    (kept,) = bridge.worker.events()
+    assert kept["message"]["content"][0]["text"] == "I'll run the tests."
+    bridge._from_codex(item("completed", **said))  # unless it finished as the bridge attached
+    assert len(bridge.worker.events()) == 1
 
 
 def test_a_thread_nobody_has_written_to_has_no_history(bridge):

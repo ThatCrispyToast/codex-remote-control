@@ -97,7 +97,7 @@ Approval cards offer **Deny** and **Allow once**. A command's card adds
 
 - Unofficial. Uses Anthropic's private Remote Control protocol and the
   experimental Codex app-server API. Tested with Codex 0.170.0 and
-  claude.ai/code on 2026-11-18.
+  claude.ai/code on 2026-11-20.
 - A Codex started with `-c`, `--enable`, `--disable` or `--search` can't be
   joined ("already has an active writer").
 - The model picker lists Claude models only and reads "Unsupported model".

@@ -67,6 +67,20 @@ what neither the README nor the code will tell you.
   of its own, with one `contextCompaction` item.
 - Nothing reports a thread's token usage until its next turn, so the context
   meter reads empty on a bridge that has just attached.
+- **Codex says nothing while its model thinks.** A `reasoning` item is
+  reported once it is over, started and completed in the same instant, and
+  with most models its summary is empty. Between a turn's start or a tool's
+  result and the next item there is only silence. The bridge takes a second
+  of it for thinking.
+- An `agentMessage` has a `phase`: `commentary` for what is said on the way,
+  `final_answer` for the answer, null from a model that doesn't say.
+- A `contextCompaction` item is in progress for as long as its turn waits on
+  the compaction, and the `thread/tokenUsage/updated` for what is left comes
+  just before it completes. Read in the source, not seen: a compaction Codex
+  prepared in the background is reported started and completed together, as
+  it is put in place.
+- An item's `completedAtMs` is null until it is finished, in
+  `thread/turns/list` too.
 
 ## What claude.ai expects
 
@@ -104,6 +118,24 @@ what neither the README nor the code will tell you.
 - Answers that take time (`get_workspace_diff`, `file_suggestions`,
   `side_question`) are worked out off the bridge's loop and posted back to
   it: the loop is the only thing that writes to the session.
+- "Thinking" beside a turn's clock is drawn for a `thinking` block begun in
+  the stream (`message_start`, then `content_block_start`), empty or not,
+  until another block begins or the message ends. A turn that is only
+  `running` shows the clock alone. The counts in `system/thinking_tokens`
+  are not shown.
+- `stop_reason: "end_turn"`, on a stored assistant message or in a stream's
+  `message_delta`, is the end of the answer: the app stops drawing the session
+  as working until something more arrives. Anything said before the answer
+  carries null. A turn whose last message carries null still ends on its
+  `result`.
+- "Compacting session" is drawn from a `system/status` of `compacting`, and
+  by the app itself when `/compact` is sent from it, until a status with a
+  `compact_result` (`success`, the `compact_boundary` after it, or `failed`)
+  or the turn's `result`. A compaction the app did not ask for is taken to be
+  over 75 seconds after the last `compacting`, so Claude Code repeats it
+  every 30. A boundary whose `post_tokens` is under its `pre_tokens` reads
+  "saved N tokens". The app's code also takes `post_tokens` for the size of
+  the context from there on.
 
 ## Where state lives
 
@@ -152,5 +184,10 @@ Codex plan and a real Claude account:
 - To see what the app sends, run the bridge with `-v` and drive the session
   in a browser. As a controller, claude-rc-api's `request_control()` and
   `send_message()` exercise most handlers without one.
+- To see what the app draws for a sequence of events, no Codex is needed:
+  serve a scratch session from a script built on claude-rc-api's
+  `examples/echo_worker.py`, write the events by hand and watch the session
+  in a browser. It spends no quota, and leaves an archived session like any
+  other test.
 - A file-write approval in read-only mode usually comes as a command approval.
   To get a `fileChange` one, ask Codex to use its `apply_patch` tool.

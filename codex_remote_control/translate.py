@@ -20,6 +20,7 @@ from claude_rc import (
     Event,
     worker_assistant,
     worker_compact_boundary,
+    worker_status,
     worker_tool_result,
 )
 
@@ -216,7 +217,8 @@ def transcript(item: dict, model: str) -> list[dict]:
     if kind == "agentMessage":
         if not item["text"]:
             return []
-        return [worker_assistant(item["text"], model=model, message_id=item["id"], stop_reason="end_turn")]
+        stop = "end_turn" if final(item) else None
+        return [worker_assistant(item["text"], model=model, message_id=item["id"], stop_reason=stop)]
     if kind == "plan":
         return [worker_assistant(item["text"], model=model)]
     if kind == "reasoning":
@@ -236,6 +238,15 @@ def transcript(item: dict, model: str) -> list[dict]:
         return []
     output, failed = tool_output(item)
     return [worker_assistant(calls, model=model), *(worker_tool_result(c["id"], output, is_error=failed) for c in calls)]
+
+
+def final(item: dict) -> bool:
+    """Whether an agent message is its turn's answer, and not something said
+    on the way to it. The app takes a message that ends the turn as the end
+    of the work, and stops showing the session as working. A model that does
+    not say which a message is has it taken as said on the way: the turn's
+    end follows an answer at once in any case."""
+    return item.get("phase") == "final_answer"
 
 
 def turn_transcript(items: list[dict], model: str) -> list[dict]:
@@ -266,11 +277,52 @@ def typed(content: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def compact_boundary(trigger: str = "auto", before: dict | None = None) -> dict:
+def compact_boundary(trigger: str = "auto", before: dict | None = None, after: dict | None = None) -> dict:
     """The mark the app draws where the thread's context was compacted.
-    ``before`` is the thread's `tokenUsage` as the compaction began."""
-    used = ((before or {}).get("last") or {}).get("totalTokens")
-    return worker_compact_boundary(trigger=trigger, pre_tokens=used)
+    ``before`` and ``after`` are the thread's `tokenUsage` as the compaction
+    began and as it ended. With both the app says how much was saved, and
+    takes the second for the size of the context from there on."""
+    def used(usage: dict | None) -> int | None:
+        return ((usage or {}).get("last") or {}).get("totalTokens")
+
+    return worker_compact_boundary(trigger=trigger, pre_tokens=used(before), post_tokens=used(after))
+
+
+def compaction_over(done: bool) -> dict:
+    """How a compaction ended, in Claude Code's words: what takes down the
+    "Compacting session" the app has shown since it was told of one."""
+    return {**worker_status(None), "compact_result": "success" if done else "failed"}
+
+
+# -- a message as it is written ---------------------------------------------------
+# The Messages API's streaming events, which Claude Code passes on as they come
+# and the app draws from: a message's start, its one block (text or a thought)
+# growing, and its end.
+def stream_start(message_id: str, model: str, thinking: bool) -> list[dict]:
+    """The start of a message and of its block. A thought begun is what the
+    app writes "Thinking" for, before there is a word of it."""
+    message = {
+        "id": message_id, "type": "message", "role": "assistant", "model": model, "content": [],
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+    block = {"type": "thinking", "thinking": "", "signature": ""} if thinking else {"type": "text", "text": ""}
+    return [{"type": "message_start", "message": message}, {"type": "content_block_start", "index": 0, "content_block": block}]
+
+
+def stream_text(text: str, thinking: bool) -> dict:
+    """More of the block's text."""
+    delta = {"type": "thinking_delta", "thinking": text} if thinking else {"type": "text_delta", "text": text}
+    return {"type": "content_block_delta", "index": 0, "delta": delta}
+
+
+STREAM_BLOCK_END = {"type": "content_block_stop", "index": 0}
+
+
+def stream_end(answer: bool = False) -> list[dict]:
+    """The end of the message. Only the turn's ``answer`` ends as the end of
+    a turn: the app stops showing the session as working when it sees one."""
+    stop = {"stop_reason": "end_turn" if answer else None, "stop_sequence": None}
+    return [{"type": "message_delta", "delta": stop}, {"type": "message_stop"}]
 
 
 def todos(plan: list[dict]) -> dict:
