@@ -71,6 +71,8 @@ codex-rc --stop --thread <thread-id>   # stop that one
   joins it with `codex --remote unix://PATH`. `$CODEX_RC_REMOTE` sets the
   default. Put it in that app-server's environment and every command it runs
   has it, `!codex-rc` included.
+- From a shell its first line is `thread <thread-id>  (<directory>)`, printed
+  before claude.ai is asked, for a script that wraps it.
 - Archiving the session in Claude stops the bridge.
 - In a side conversation, `!codex-rc` serves the thread it came from. A temporary
   one can't tell which that is, and says to type it in the main thread.

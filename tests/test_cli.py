@@ -196,3 +196,46 @@ def test_the_worker_keeps_the_record_in_step_with_the_state_it_reports(tmp_path,
         assert cli.background.running("thr-1")["started"] > 0
     finally:
         record.close()
+
+
+class Serves:
+    """The app-server as `codex-rc NAME` meets it from a shell: a new thread, named."""
+
+    def __init__(self, remote=None):
+        self.remote, self.requests = remote, []
+
+    def connect(self):
+        pass
+
+    def close(self):
+        pass
+
+    def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "01234567-89ab-7cde-8f01-23456789abcd", "cwd": params["cwd"], "name": None},
+                    "cwd": params["cwd"]}
+        return {}
+
+
+def test_the_thread_comes_first_and_before_claude_ai_is_asked(tmp_path, monkeypatch, capsys):
+    """A wrapper reads the thread from the first line, so it must be out, flushed,
+    even when claude.ai never answers."""
+    from claude_rc import CredentialsError
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.delenv("CODEX_RC_REMOTE", raising=False)
+    codex = []
+    monkeypatch.setattr(cli, "AppServer", lambda remote=None: codex.append(Serves(remote)) or codex[-1])
+
+    def no_login():
+        raise CredentialsError("no credentials")
+
+    monkeypatch.setattr(cli, "RemoteControlClient", no_login)
+    assert cli.main(["--remote", "unix:///run/agent/app-server.sock", "-C", str(tmp_path), "Agent"]) == 1
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == f"thread   01234567-89ab-7cde-8f01-23456789abcd  ({tmp_path})"
+    assert codex[0].remote == "unix:///run/agent/app-server.sock"
+    assert [method for method, _ in codex[0].requests] == ["thread/start", "thread/name/set"]
+    assert not list((tmp_path / "codex-remote-control").glob("*.json"))  # the record went with it
