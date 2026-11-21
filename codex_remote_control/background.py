@@ -45,12 +45,15 @@ def _private(directory: Path) -> None:
 
 
 class Record:
-    """A running bridge's own record. Hold it for the life of the process."""
+    """A running bridge's own record. Hold it for the life of the process.
+    It says what the bridge serves (`session`, `title`, `cwd`), since when
+    (`started`, epoch seconds), and how the session stands (`state`: `idle`,
+    `running`, or `requires_action` while a prompt waits on the app)."""
 
     def __init__(self, path: Path, file) -> None:
         self.path = path
         self._file = file
-        self._info = {"pid": os.getpid()}
+        self._info = {"pid": os.getpid(), "started": time.time()}
         self.update()
 
     def update(self, **info) -> None:

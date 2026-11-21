@@ -88,7 +88,7 @@ SIDE_OF_SIDE = {"id": "thr-side-2", "attachedToThreadId": "thr-side"}
 def typed_in(thread_id, monkeypatch, *threads):
     """Run `!codex-rc` typed in a thread's session: which thread goes on Remote Control."""
     monkeypatch.setenv("CODEX_THREAD_ID", thread_id)
-    monkeypatch.setattr(cli, "AppServer", lambda: Codex(*threads))
+    monkeypatch.setattr(cli, "AppServer", lambda remote=None: Codex(*threads))
     served = []
     monkeypatch.setattr(cli, "serve_from_background", lambda thread, args: served.append(thread) or 0)
     cli.main([])
@@ -111,6 +111,9 @@ def test_when_codex_cannot_say_the_thread_typed_in_is_served(monkeypatch):
     """Serving it then reports what is wrong, as it always has."""
 
     class Gone(Codex):
+        def __init__(self, remote=None):
+            super().__init__()
+
         def connect(self):
             raise ConnectionRefusedError("no daemon")
 
@@ -145,3 +148,51 @@ def test_what_stops_the_bridge_is_said_in_a_line():
     assert cli.explain(cli.httpx.ConnectError("no route")) == "Could not reach claude.ai: no route"
     assert cli.explain(ConnectionRefusedError("refused")) == "Could not reach Codex's app-server: refused"
     assert "could not read" in cli.explain(ValueError("not JSON"))
+
+
+class Starts:
+    """The app-server as a new thread meets it: started, then perhaps named."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, method, params):
+        self.requests.append((method, params))
+        return {"thread": {"id": "thr-new", "cwd": params.get("cwd"), "name": None}} if method == "thread/start" else {}
+
+
+def new_thread(*argv):
+    codex = Starts()
+    args = cli.argparse.Namespace(thread=None, last=False, cd="/home/me/project", model=None, name=None)
+    for key, value in argv:
+        setattr(args, key, value)
+    return codex, cli.open_thread(codex, args)
+
+
+def test_a_new_thread_given_a_name_takes_it_in_codex_which_lets_a_tui_join_it():
+    """Naming writes the thread to disk, and `codex resume <id>` finds "no rollout" until then."""
+    codex, opened = new_thread(("name", "Agent"), ("model", "gpt-x"))
+    assert codex.requests == [
+        ("thread/start", {"cwd": "/home/me/project", "model": "gpt-x"}),
+        ("thread/name/set", {"threadId": "thr-new", "name": "Agent"}),
+    ]
+    assert opened["thread"]["name"] == "Agent"
+    codex, opened = new_thread()
+    assert [method for method, _ in codex.requests] == ["thread/start"]  # left for Codex to name
+
+
+def test_the_worker_keeps_the_record_in_step_with_the_state_it_reports(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    reported = []
+    monkeypatch.setattr(cli.RemoteControlWorker, "report_state", lambda self, status, **kw: reported.append(status))
+    record = cli.background.claim("thr-1")
+    try:
+        worker = cli.RecordedWorker(record, None, "cse_1")
+        assert cli.background.running("thr-1").get("state") is None
+        for status in ("idle", "running", "requires_action"):
+            worker.report_state(status)
+            assert cli.background.running("thr-1")["state"] == status
+        assert reported == ["idle", "running", "requires_action"]
+        assert cli.background.running("thr-1")["started"] > 0
+    finally:
+        record.close()

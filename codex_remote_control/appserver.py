@@ -3,7 +3,9 @@
 Codex keeps one app-server per user as a background daemon, and every `codex`
 TUI on the machine is a client of it. This connects to that same daemon over
 its control socket (WebSocket on a Unix socket), so a thread driven from here
-is the thread a TUI sees, live, and the other way round.
+is the thread a TUI sees, live, and the other way round. Given a `remote`, it
+connects instead to an app-server of its own, the one `codex app-server
+--listen unix://PATH` runs and `codex --remote unix://PATH` joins.
 
 The protocol is Codex's own: `codex app-server generate-ts --out DIR` writes
 its types. Checked against Codex 0.170.0.
@@ -33,7 +35,7 @@ class AppServerError(RuntimeError):
 
 
 class AppServerClosed(ConnectionError):
-    """The connection to the app-server daemon is gone (it restarts to update itself)."""
+    """The connection to the app-server is gone (the daemon restarts to update itself)."""
 
 
 def start_daemon() -> str:
@@ -45,12 +47,23 @@ def start_daemon() -> str:
     return json.loads(out)["socketPath"]
 
 
-class AppServer:
-    """One connection to the daemon. :meth:`request` may be called from any
-    thread; notifications and the server's own requests (approvals) come out
-    of :meth:`messages`."""
+def remote_socket(remote: str) -> str:
+    """The socket path of a `unix://PATH` address, the form of `codex --remote`
+    that codex-rc takes. ValueError for any other."""
+    path = remote.removeprefix("unix://")
+    if path == remote or not path.startswith("/"):
+        raise ValueError(f"{remote!r} is not unix://PATH with an absolute PATH")
+    return path
 
-    def __init__(self) -> None:
+
+class AppServer:
+    """One connection to the daemon, or with ``remote`` (``unix://PATH``) to the
+    app-server listening there. :meth:`request` may be called from any thread;
+    notifications and the server's own requests (approvals) come out of
+    :meth:`messages`."""
+
+    def __init__(self, remote: str | None = None) -> None:
+        self.remote = remote
         self._ws: ClientConnection | None = None
         self._send_lock = threading.Lock()
         self._next_id = 0
@@ -58,7 +71,8 @@ class AppServer:
         self._inbox: queue.Queue = queue.Queue()
 
     def connect(self) -> None:
-        self._ws = unix_connect(start_daemon(), max_size=None)
+        socket = start_daemon() if self.remote is None else remote_socket(self.remote)
+        self._ws = unix_connect(socket, max_size=None)
         threading.Thread(target=self._read, name="codex-app-server", daemon=True).start()
         self.request("initialize", {
             "clientInfo": {"name": "codex-remote-control", "title": "Claude Remote Control", "version": __version__},

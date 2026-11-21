@@ -53,6 +53,34 @@ what neither the README nor the code will tell you.
   one against `model/list` itself.
 - A thread nobody has written to yet is "not materialized": `thread/turns/list`
   refuses it. It has no turns, which is how the bridge reads that refusal.
+- **A TUI joins a thread only once it is on disk.** `codex resume <id>`, with
+  or without `--remote`, looks for the thread's rollout file, and for a new
+  thread nobody has written to it answers "no rollout found for thread id",
+  even while another client holds the thread loaded. `thread/name/set` writes
+  it, which is why a new thread given a name is named at once.
+  `thread/metadata/update` takes no empty patch, so an unnamed new thread
+  can be joined only after its first turn.
+- **What a session runs, the app-server runs.** `!` commands and the model's
+  commands are children of the app-server process: its cgroup, and its
+  environment with the login shell's PATH on top, never the TUI's. With the
+  shared daemon that is wherever the daemon was first started.
+- **An app-server of one's own:** `codex app-server --listen unix://PATH`
+  serves threads by itself, beside the shared daemon and from the same
+  `~/.codex`. PATH is made a symlink to a socket under
+  `/tmp/codex-daemon-<uid>/` (the socket path length limit), and both go on a
+  clean exit. `-c` overrides given to it are the defaults of every thread
+  started there (`sandbox_mode`, `approval_policy`, `developer_instructions`,
+  the model and effort), in a directory Codex does not trust too, where a
+  thread would otherwise start read-only.
+- A TUI joined to it (`codex --remote unix://PATH`) takes `-c` without going
+  embedded, since it has no server of its own. Resuming a thread it kept the
+  thread's model, sandbox and approvals, and asked no folder-trust question in
+  a directory Codex had not seen.
+- **Two TUI prompts take the next Enter:** the update offer at startup, whose
+  first choice runs `npm install -g @openai/codex`, and the nudge to switch
+  to a cheaper model as the rate limit nears. A TUI that something else types
+  into wants `-c check_for_update_on_startup=false -c
+  notice.hide_rate_limit_model_nudge=true`.
 - An approval's `availableDecisions` for a command are `accept`, a rule
   (`acceptWithExecpolicyAmendment`) and `cancel`. There is no
   `acceptForSession` and no `decline`. The rule is one Codex keeps after the
@@ -144,7 +172,11 @@ what neither the README nor the code will tell you.
   one starting with `Codex: ` follows its thread, any other is kept.
 - Each running bridge holds a locked record in
   `~/.local/state/codex-remote-control/` (`$XDG_STATE_HOME`). The lock, not
-  the pid in the record, is what says a bridge is alive.
+  the pid in the record, is what says a bridge is alive. The record also says
+  when the bridge started and the session's `state` as the worker last
+  reported it to claude.ai (`idle`, `running`, `requires_action`), which is
+  how `--list`, or anything counting agents at work, tells a busy bridge from
+  an idle one. It is rewritten in place, so a reader can catch it empty.
 - Every `result` event the bridge writes for a Codex turn carries that turn's
   id as `codex_turn`. A bridge taking a session up again reads the newest one
   to know which turns the transcript lacks. A command's answer is a `result`
@@ -163,7 +195,9 @@ Codex plan and a real Claude account:
   `low` when this was written). In a TUI that is `codex -m <model>` and then
   `/model <model> --reasoning=low`, because `-c model_reasoning_effort=low`
   would put the session in embedded mode. Most checks need no turn at all:
-  `!` commands are free.
+  `!` commands are free. An app-server of your own started with
+  `-c model=… -c model_reasoning_effort=low` makes every thread on it cheap
+  from the start, and a `--remote` TUI and `codex-rc --remote` can both join it.
 - **Sessions cannot be deleted, only archived.** Every test leaves an archived
   session on the account. Use one thread for a whole run, since serving it
   again finds its session again, then archive the test sessions and the Codex

@@ -365,14 +365,15 @@ class Bridge:
 
     def _reconnect(self) -> None:
         """The app-server went away, and the running turn with it. Close that
-        turn for the controllers, then subscribe to the thread again."""
+        turn for the controllers, then subscribe to the thread again, on the
+        app-server it was served from."""
         log.warning("lost the Codex app-server; reconnecting")
         if self.turn is not None:
             self._turn_completed({"turn": {"status": "failed", "error": {"message": "The Codex app-server restarted mid-turn."}}})
         for attempt in range(_RECONNECT_TRIES):
             time.sleep(min(30, 2**attempt))
             try:
-                codex = AppServer()
+                codex = AppServer(self.codex.remote)
                 codex.connect()
                 opened = codex.request("thread/resume", {"threadId": self.thread_id, "excludeTurns": True})
             except (OSError, AppServerError, AppServerClosed, TimeoutError) as e:

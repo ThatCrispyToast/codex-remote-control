@@ -14,7 +14,7 @@ from codex_remote_control import background
 thread, options = sys.argv[1], sys.argv[2:]
 record = background.claim(thread)
 title = options[options.index("--") + 1] if "--" in options else "Codex: w"
-record.update(session="https://claude.ai/code/session_1", title=title, options=options, env=os.environ.get("CODEX_THREAD_ID"))
+record.update(session="https://claude.ai/code/session_1", title=title, options=options, env=os.environ.get("CODEX_THREAD_ID"), state="idle")
 signal.signal(signal.SIGTERM, lambda *_: (record.close(), sys.exit(0)))
 time.sleep(60)
 """
@@ -25,7 +25,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.setattr(background, "_COMMAND", [sys.executable, "-c", BRIDGE])
-    monkeypatch.setattr(cli, "main_thread", lambda thread_id: thread_id)  # no Codex to ask
+    monkeypatch.setattr(cli, "main_thread", lambda thread_id, remote: thread_id)  # no Codex to ask
     yield tmp_path / "codex-remote-control"
     background.stop(THREAD)
 
@@ -125,7 +125,22 @@ def test_list_shows_what_is_on_remote_control(capsys):
     assert capsys.readouterr().out == "nothing is on Remote Control\n"
     background.start(THREAD, ["--", "My Project"])
     assert cli.main(["--list"]) == 0
-    assert capsys.readouterr().out == 'thr-1  https://claude.ai/code/session_1  "My Project"\n'
+    assert capsys.readouterr().out == 'thr-1  idle  https://claude.ai/code/session_1  "My Project"\n'
+
+
+def test_a_bridge_on_an_app_server_of_its_own_starts_its_background_bridge_there(monkeypatch):
+    """`!codex-rc` typed in a TUI joined to that app-server finds it in the environment."""
+    monkeypatch.setenv("CODEX_THREAD_ID", THREAD)
+    monkeypatch.setenv("CODEX_RC_REMOTE", "unix:///run/agent/app-server.sock")
+    assert cli.main(["Agent"]) == 0
+    assert background.running(THREAD)["options"] == ["--remote", "unix:///run/agent/app-server.sock", "--", "Agent"]
+
+
+def test_a_remote_codex_rc_cannot_reach_is_refused_at_once(monkeypatch, capsys):
+    for remote in ("ws://127.0.0.1:4500", "unix://", "unix://relative.sock"):
+        with pytest.raises(SystemExit):
+            cli.main(["--remote", remote, "--list"])
+        assert "--remote" in capsys.readouterr().err
 
 
 def test_an_attached_file_is_kept_private_until_its_thread_is_gone(state):

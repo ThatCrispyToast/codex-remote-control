@@ -20,12 +20,16 @@ from claude_rc import (
 )
 
 from . import __version__, background, workspace
-from .appserver import AppServer, AppServerClosed, AppServerError
+from .appserver import AppServer, AppServerClosed, AppServerError, remote_socket
 from .bridge import TITLE_PREFIX, Bridge, ThreadClosed, session_title
 
 # The session tag that ties a Remote Control session to its Codex thread, so
 # serving a thread again finds its session instead of making another.
 THREAD_TAG = "codex-thread:"
+
+# What --remote defaults to. Set in the environment of an app-server of one's
+# own, it reaches every command that app-server runs, `!codex-rc` included.
+REMOTE_ENV = "CODEX_RC_REMOTE"
 
 _THREAD_ID = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
 
@@ -35,14 +39,29 @@ _NOT_SHARED = (
 )
 
 
-def main_thread(thread_id: str) -> str:
+class RecordedWorker(RemoteControlWorker):
+    """The session's worker, keeping its bridge's record in step with the state
+    it reports to claude.ai: `idle`, `running`, or `requires_action` while a
+    prompt waits. `--list` shows it, and anything counting agents at work can
+    read it there."""
+
+    def __init__(self, record: background.Record, *args, **kwargs) -> None:
+        self.record = record
+        super().__init__(*args, **kwargs)
+
+    def report_state(self, status: str, **kwargs) -> None:
+        super().report_state(status, **kwargs)
+        self.record.update(state=status)
+
+
+def main_thread(thread_id: str, remote: str | None) -> str:
     """The thread a Codex session typed in belongs to. A side conversation is
     a thread of its own, and a `!` command typed in it is given its id, but it
     is a fork: serving it would serve the thread as it stood when the side
     conversation began. A saved one names the thread it is attached to. A
     temporary one names none, and Codex keeps no history of it to serve. If
     Codex can't say, the id stands, and serving it reports what is wrong."""
-    codex = AppServer()
+    codex = AppServer(remote)
     try:
         codex.connect()
         while True:
@@ -61,7 +80,11 @@ def main_thread(thread_id: str) -> str:
 def open_thread(codex: AppServer, args: argparse.Namespace) -> dict:
     """Subscribe to the thread to serve: the one named, the directory's most
     recent with `--last`, or a new one. Returns the app-server's answer, which
-    carries the thread and its settings."""
+    carries the thread and its settings.
+
+    A new thread given a name takes it in Codex too. Naming it is also what
+    writes it to disk, and a TUI can join a thread (`codex resume <id>`) only
+    once it is there: until then Codex finds "no rollout" for it."""
     thread_id = args.thread
     if args.last:
         recent = codex.request("thread/list", {"cwd": args.cd, "limit": 1})["data"]
@@ -70,7 +93,11 @@ def open_thread(codex: AppServer, args: argparse.Namespace) -> dict:
         thread_id = recent[0]["id"]
     if thread_id:
         return codex.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
-    return codex.request("thread/start", {"cwd": args.cd, **({"model": args.model} if args.model else {})})
+    opened = codex.request("thread/start", {"cwd": args.cd, **({"model": args.model} if args.model else {})})
+    if args.name:
+        codex.request("thread/name/set", {"threadId": opened["thread"]["id"], "name": args.name})
+        opened["thread"]["name"] = args.name
+    return opened
 
 
 def open_session(rc: RemoteControlClient, thread: dict, name: str | None) -> tuple[str, str, bool, bool]:
@@ -119,13 +146,14 @@ def explain(error: Exception) -> str:
 
 
 def list_bridges() -> int:
-    """Print the threads on Remote Control from this machine."""
+    """Print the threads on Remote Control from this machine, each with how
+    its session stands: idle, running, or requires_action."""
     serving = background.bridges()
     if not serving:
         print("nothing is on Remote Control")
     for thread_id, bridge in serving.items():
         where = f"  {bridge['cwd']}" if bridge.get("cwd") else ""
-        print(f'{thread_id}  {bridge.get("session", "starting")}  "{bridge.get("title", "")}"{where}')
+        print(f'{thread_id}  {bridge.get("state", "starting")}  {bridge.get("session", "")}  "{bridge.get("title", "")}"{where}')
     return 0
 
 
@@ -147,7 +175,11 @@ def serve_from_background(thread_id: str, args: argparse.Namespace) -> int:
     session gets its prompt back."""
     if args.name and background.running(thread_id):
         background.stop(thread_id)  # a bridge takes its session's name as it starts
-    options = [*(["-v"] if args.verbose else []), *(["--", args.name] if args.name else [])]
+    options = [
+        *(["--remote", args.remote] if args.remote else []),
+        *(["-v"] if args.verbose else []),
+        *(["--", args.name] if args.name else []),
+    ]
     try:
         bridge = background.start(thread_id, options)
     except background.StartFailed as e:
@@ -171,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--last", action="store_true", help="serve the directory's most recent thread")
     parser.add_argument("-C", "--cd", metavar="DIR", default=os.getcwd(), help="the directory a new thread works in (default: here)")
     parser.add_argument("-m", "--model", help="the model of a new thread (default: Codex's own)")
+    parser.add_argument(
+        "--remote", metavar="unix://PATH", default=os.environ.get(REMOTE_ENV) or None,
+        help="serve from the app-server listening there (`codex app-server --listen unix://PATH`), as "
+        f"`codex --remote` joins it (default: ${REMOTE_ENV}, else Codex's shared background server)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="log what crosses the bridge")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
@@ -179,6 +216,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("give --thread or --last, not both")
     if args.name and _THREAD_ID.fullmatch(args.name):
         parser.error(f"that is a thread id, not a name: use --thread {args.name}")
+    if args.remote:
+        try:
+            remote_socket(args.remote)
+        except ValueError as e:
+            parser.error(f"--remote: {e}")
     # Codex sets this for what a session runs, which is how `!codex-rc` knows its thread.
     here = os.environ.get("CODEX_THREAD_ID")
     args.thread = args.thread or (None if args.last else here)
@@ -186,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         return list_bridges()
     side = False
     if here and args.thread == here:
-        args.thread = main_thread(here)
+        args.thread = main_thread(here, args.remote)
         side = args.thread != here
     if args.stop:
         return stop_bridge(args.thread, parser)
@@ -202,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Stop on SIGTERM as on Ctrl-C, so the session says goodbye either way.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
-    codex = AppServer()
+    codex = AppServer(args.remote)
     try:
         codex.connect()
         opened = open_thread(codex, args)
@@ -217,14 +259,15 @@ def main(argv: list[str] | None = None) -> int:
         other = background.running(thread["id"]) or {}
         sys.exit(f"this thread is already on Remote Control ({other.get('session', 'starting')}): take it off with --stop")
 
+    # The thread first, and at once: it is there whether or not claude.ai answers.
+    print(f"thread   {thread['id']}  ({opened['cwd']})", flush=True)
     try:
         rc = RemoteControlClient()
         session_id, title, new_session, follow_name = open_session(rc, thread, args.name)
         record.update(session=session_url(session_id), title=title, cwd=opened["cwd"])
-        print(f"thread   {thread['id']}  ({opened['cwd']})")
         print(f"session  {session_url(session_id)}  ({title})")
-        print(f"tui      codex resume {thread['id']}", flush=True)
-        with RemoteControlWorker(rc, session_id) as worker:
+        print(f"tui      codex{f' --remote {args.remote}' if args.remote else ''} resume {thread['id']}", flush=True)
+        with RecordedWorker(record, rc, session_id) as worker:
             bridge = Bridge(codex, worker, opened, follow_name=follow_name)
             bridge.backfill(new=new_session)
             bridge.run()

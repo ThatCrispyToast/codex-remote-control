@@ -52,17 +52,25 @@ codex-rc --last                        # this directory's most recent thread
 codex-rc --thread <thread-id>          # a specific thread
 codex-rc -C ~/project My Project       # new thread in another directory, named
 codex-rc -m <model>                    # new thread on that model
+codex-rc --remote unix:///tmp/app.sock # a thread of the app-server listening there
 codex-rc -v                            # log what crosses the bridge
 
 # Either
-codex-rc --list                        # threads on Remote Control from this machine
+codex-rc --list                        # threads on Remote Control from this machine, idle or running
 codex-rc --stop                        # stop the only one
 codex-rc --stop --thread <thread-id>   # stop that one
 ```
 
 - A new session starts with the thread's latest turns: up to 30, fewer when they
   are long.
-- Closing the terminal leaves the session up. `codex resume` rejoins it.
+- Closing the terminal leaves the session up. `codex resume` rejoins it. A new
+  thread given a name takes it in Codex too, which lets `codex resume` join it
+  before its first turn.
+- `--remote` serves from an app-server of your own
+  (`codex app-server --listen unix://PATH`) instead of Codex's shared one; a TUI
+  joins it with `codex --remote unix://PATH`. `$CODEX_RC_REMOTE` sets the
+  default. Put it in that app-server's environment and every command it runs
+  has it, `!codex-rc` included.
 - Archiving the session in Claude stops the bridge.
 - In a side conversation, `!codex-rc` serves the thread it came from. A temporary
   one can't tell which that is, and says to type it in the main thread.
