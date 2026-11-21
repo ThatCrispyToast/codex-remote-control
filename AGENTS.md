@@ -164,6 +164,12 @@ what neither the README nor the code will tell you.
   every 30. A boundary whose `post_tokens` is under its `pre_tokens` reads
   "saved N tokens". The app's code also takes `post_tokens` for the size of
   the context from there on.
+- A worker that leaves says goodbye (`connection_status: disconnected`), and
+  the app shows the session disconnected at once. Without one it stays
+  `connected` until the heartbeats have lapsed, a minute. A systemd stop
+  sends SIGTERM twice, the second as soon as the unit's main process has
+  gone, so only the first one stops the bridge: the second, taken the same
+  way, would land in the goodbye and cut it short.
 
 ## Where state lives
 

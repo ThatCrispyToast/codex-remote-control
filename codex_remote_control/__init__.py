@@ -1,3 +1,3 @@
 """Steer a Codex session from claude.ai/code and the Claude apps."""
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

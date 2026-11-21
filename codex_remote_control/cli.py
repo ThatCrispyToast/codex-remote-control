@@ -126,6 +126,17 @@ def session_url(session_id: str) -> str:
     return f"https://claude.ai/code/{session_id.replace('cse_', 'session_', 1)}"
 
 
+def on_sigterm(signum: int, frame) -> None:
+    """Stop on SIGTERM as on Ctrl-C, so the session says goodbye either way,
+    and on the first one only. Stopping a unit, systemd sends a second SIGTERM
+    to what is left as soon as the unit's main process has gone: taken like
+    the first, it cuts the goodbye short, and the app shows the session
+    connected until its heartbeats lapse. The SIGKILL that ends a stop that
+    times out still ends a goodbye that hangs."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 def explain(error: Exception) -> str:
     """What stopped the bridge, in a line its user can act on: the command is
     typed at a Codex prompt, where a traceback helps nobody."""
@@ -242,8 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
-    # Stop on SIGTERM as on Ctrl-C, so the session says goodbye either way.
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, on_sigterm)
     codex = AppServer(args.remote)
     try:
         codex.connect()

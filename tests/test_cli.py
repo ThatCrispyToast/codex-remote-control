@@ -1,4 +1,6 @@
 """The command: which session a thread gets, and what it is called."""
+import signal
+
 import pytest
 
 from codex_remote_control import cli
@@ -239,3 +241,17 @@ def test_the_thread_comes_first_and_before_claude_ai_is_asked(tmp_path, monkeypa
     assert codex[0].remote == "unix:///run/agent/app-server.sock"
     assert [method for method, _ in codex[0].requests] == ["thread/start", "thread/name/set"]
     assert not list((tmp_path / "codex-remote-control").glob("*.json"))  # the record went with it
+
+
+def test_only_the_first_sigterm_stops_the_bridge():
+    """Stopping a unit, systemd sends a second SIGTERM as soon as the unit's
+    main process has gone. Taken like the first, it would interrupt the
+    goodbye, and the app would show the session connected for another minute."""
+    previous = signal.signal(signal.SIGTERM, cli.on_sigterm)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGTERM)
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+        signal.raise_signal(signal.SIGTERM)  # the second, mid-goodbye: nothing happens
+    finally:
+        signal.signal(signal.SIGTERM, previous)
