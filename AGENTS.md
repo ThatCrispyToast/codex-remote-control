@@ -197,7 +197,9 @@ Codex plan and a real Claude account:
   would put the session in embedded mode. Most checks need no turn at all:
   `!` commands are free. An app-server of your own started with
   `-c model=… -c model_reasoning_effort=low` makes every thread on it cheap
-  from the start, and a `--remote` TUI and `codex-rc --remote` can both join it.
+  from the start, and a `--remote` TUI and `codex-rc --remote` can both join it. `codex debug
+  prompt-input` (taking the same `-c` overrides) prints what the model would be
+  sent, instructions included, without a turn.
 - **Sessions cannot be deleted, only archived.** Every test leaves an archived
   session on the account. Use one thread for a whole run, since serving it
   again finds its session again, then archive the test sessions and the Codex
