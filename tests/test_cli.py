@@ -11,8 +11,8 @@ THREAD = {"id": "thr-1", "cwd": "/home/me/project", "name": None}
 class Account:
     """The sessions side of claude_rc's client, with one session or none."""
 
-    def __init__(self, title=None):
-        self.existing = [] if title is None else [{"id": "cse_old", "title": title}]
+    def __init__(self, title=None, status="active"):
+        self.existing = [] if title is None else [{"id": "cse_old", "title": title, "status": status}]
         self.calls = []
 
     def sessions(self, **filters):
@@ -21,6 +21,13 @@ class Account:
 
     def rename_session(self, session_id, title):
         self.calls.append(("rename", session_id, title))
+
+    def unarchive_session(self, session_id):
+        self.calls.append(("unarchive", session_id))
+        return True
+
+    def update_session(self, session_id, **fields):
+        self.calls.append(("update", session_id, fields))
 
     def create_session(self, title, **fields):
         self.calls.append(("create", title, fields))
@@ -31,7 +38,7 @@ def test_a_thread_never_served_gets_a_session_titled_after_it():
     account = Account()
     assert cli.open_session(account, THREAD, None) == ("cse_new", "Codex: project", True, True)
     assert account.calls == [
-        ("sessions", {"tags": "codex-thread:thr-1", "statuses": "active"}),
+        ("sessions", {"tags": "codex-thread:thr-1"}),
         ("create", "Codex: project", {
             "cwd": "/home/me/project", "tags": ["codex-thread:thr-1"], "repository": None, "branch": None}),
     ]
@@ -64,6 +71,50 @@ def test_a_session_keeps_the_name_it_was_given_until_it_is_given_another():
     assert [call[0] for call in account.calls] == ["sessions"]  # nothing renamed
     assert cli.open_session(account, THREAD, "Other") == ("cse_old", "Other", False, False)
     assert account.calls[-1] == ("rename", "cse_old", "Other")
+
+
+def test_a_session_its_bridge_ended_is_reopened_for_the_thread():
+    """A bridge archives its session as it stops. Serving the thread again is
+    the same session, with its transcript and its name."""
+    account = Account("My Project", status="archived")
+    assert cli.open_session(account, THREAD, None) == ("cse_old", "My Project", False, False)
+    assert [call[0] for call in account.calls] == ["sessions", "unarchive"]
+
+
+def test_a_live_session_is_taken_before_an_archived_one():
+    account = Account("Codex: project", status="archived")
+    account.existing.append({"id": "cse_live", "title": "Codex: project", "status": "active"})
+    assert cli.open_session(account, THREAD, None)[0] == "cse_live"
+    assert [call[0] for call in account.calls] == ["sessions"]
+
+
+def test_a_session_that_cannot_be_reopened_is_replaced():
+    from claude_rc import APIError
+
+    account = Account("Codex: project", status="archived")
+
+    def gone(session_id):
+        raise APIError(404, "not found", None)
+
+    account.unarchive_session = gone
+    assert cli.open_session(account, THREAD, None)[0] == "cse_new"
+
+
+def test_a_session_that_moves_to_a_new_thread_is_found_by_it(tmp_path, monkeypatch, capsys):
+    """`/clear`: the tag, the record and the line a wrapper reads all name the new thread."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    account, record = Account(), cli.background.claim("thr-1")
+    try:
+        cli.follow(account, "cse_1", record, "unix:///run/a.sock", "thr-1", {"id": "thr-2", "cwd": "/w"})
+        assert account.calls == [("update", "cse_1", {
+            "add_tags": ["codex-thread:thr-2"], "remove_tags": ["codex-thread:thr-1"]})]
+        assert cli.background.running("thr-1") is None and cli.background.running("thr-2")["pid"]
+        assert cli.background.claim("thr-2") is None  # still this bridge's, locked
+        assert capsys.readouterr().out.splitlines() == [
+            "thread   thr-2  (/w)", "tui      codex --remote unix:///run/a.sock resume thr-2"]
+    finally:
+        record.close()
+    assert not list((tmp_path / "codex-remote-control").iterdir())
 
 
 class Codex:
@@ -255,3 +306,55 @@ def test_only_the_first_sigterm_stops_the_bridge():
         signal.raise_signal(signal.SIGTERM)  # the second, mid-goodbye: nothing happens
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def served(monkeypatch, tmp_path, ends):
+    """Run `codex-rc` from a shell with a bridge that stops as ``ends`` says:
+    its exit status, and how its worker was left."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.delenv("CODEX_RC_REMOTE", raising=False)
+    monkeypatch.setattr(cli, "AppServer", Serves)
+    monkeypatch.setattr(cli, "RemoteControlClient", Account)
+    left = []
+
+    class Seat:
+        def __init__(self, record, rc, session_id):
+            pass
+
+        def connect(self):
+            left.append("connected")
+
+        def close(self, **how):
+            left.append(how)
+
+    class Stops:
+        def __init__(self, codex, worker, opened, **kw):
+            pass
+
+        def backfill(self, new):
+            pass
+
+        def run(self):
+            raise ends
+
+    monkeypatch.setattr(cli, "RecordedWorker", Seat)
+    monkeypatch.setattr(cli, "Bridge", Stops)
+    return cli.main(["-C", str(tmp_path)]), left
+
+
+@pytest.mark.parametrize("ends", [KeyboardInterrupt(), cli.Exited(), cli.ThreadClosed("thr"), cli.AppServerClosed("gone")])
+def test_however_the_bridge_stops_its_session_ends_with_it(tmp_path, monkeypatch, ends):
+    """A session left listed as disconnected has to be archived by hand."""
+    status, left = served(monkeypatch, tmp_path, ends)
+    assert left == ["connected", {"archive": True}]
+    assert status == (1 if isinstance(ends, cli.AppServerClosed) else 0)
+    assert not list((tmp_path / "codex-remote-control").glob("*.json"))
+
+
+def test_exit_typed_in_the_app_is_said_on_the_last_line(tmp_path, monkeypatch, capsys):
+    """For a script that runs Codex beside the command, to end that too."""
+    assert served(monkeypatch, tmp_path, cli.Exited())[0] == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "exit     typed in the app"
+    served(monkeypatch, tmp_path, KeyboardInterrupt())
+    assert not capsys.readouterr().out.splitlines()[-1].startswith("exit")

@@ -31,8 +31,8 @@ wheels = [
 
 [[package]]
 name = "claude-rc-api"
-version = "0.7.0"
-source = { git = "https://github.com/ThatCrispyToast/claude-rc-api?rev=a297bce6d247afd22ac2c860352f28fdd62400cf#a297bce6d247afd22ac2c860352f28fdd62400cf" }
+version = "0.8.0"
+source = { git = "https://github.com/ThatCrispyToast/claude-rc-api?rev=3571ab6fe5d8911965164c0d2966878c7eeaaad3#3571ab6fe5d8911965164c0d2966878c7eeaaad3" }
 dependencies = [
     { name = "httpx" },
 ]
@@ -54,7 +54,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-rc-api", git = "https://github.com/ThatCrispyToast/claude-rc-api?rev=a297bce6d247afd22ac2c860352f28fdd62400cf" },
+    { name = "claude-rc-api", git = "https://github.com/ThatCrispyToast/claude-rc-api?rev=3571ab6fe5d8911965164c0d2966878c7eeaaad3" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
     { name = "websockets", specifier = ">=13" },

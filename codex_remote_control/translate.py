@@ -593,7 +593,18 @@ def sandbox(settings: dict) -> str:
     return f"Sandbox: {access}{network}. Approvals: {asks.get(settings['approvalPolicy'], settings['approvalPolicy'])}."
 
 
-def report(*, thread: dict, settings: dict, usage: dict | None, rate_limits: dict | None, models: list[str]) -> str:
+def terminals(running: list[dict]) -> str:
+    """The background terminals of a thread (`thread/backgroundTerminals/list`)
+    as `/ps` answers: each command still running, and where."""
+    if not running:
+        return "No background terminals are running."
+    lines = [f"- `{shell_script(terminal['command'])}` in `{terminal['cwd']}`" for terminal in running]
+    return "\n".join(["**Background terminals** (`/stop` ends them)", *lines])
+
+
+def report(
+    *, thread: dict, settings: dict, usage: dict | None, rate_limits: dict | None, models: list[str], resume: str,
+) -> str:
     """What `/codex` answers: the Codex side of the session, which the app's
     own status and usage cards (they describe the Claude account) leave out."""
     effort = settings.get("effort")
@@ -611,7 +622,7 @@ def report(*, thread: dict, settings: dict, usage: dict | None, rate_limits: dic
     if plan := (rate_limits or {}).get("planType"):
         lines.append(f"- Plan: {plan}")
     lines.append(f"- Models, for `/model <id>`: {', '.join(f'`{m}`' for m in models)}")
-    lines.append(f"- In a terminal: `codex resume {thread['id']}`")
+    lines.append(f"- In a terminal: `{resume}`")
     return "\n".join(lines)
 
 

@@ -93,6 +93,16 @@ what neither the README nor the code will tell you.
   turn. It is what `/btw` runs on, and it spends quota like a turn.
 - `thread/compact/start` answers `{}` and the compaction then runs as a turn
   of its own, with one `contextCompaction` item.
+- A thread nobody has written to takes `thread/settings/update` and
+  `thread/name/set` like any other. That is how `/clear` makes its new thread
+  stand as the old one stood. `thread/unsubscribe` answers `unsubscribed` and
+  ends the old thread's notifications.
+- The TUI's own `/new` and `/clear` move that TUI to a new thread. Nothing in
+  the app-server moves a TUI from outside, so a terminal on the thread stays
+  on the old one after the bridge's `/clear`.
+- `thread/backgroundTerminals/list` names what the model left running
+  (`command`, `cwd`, `processId`), and `…/clean` kills them all. A command
+  started that way ends its turn with its tool call still open.
 - Nothing reports a thread's token usage until its next turn, so the context
   meter reads empty on a bridge that has just attached.
 - **Codex says nothing while its model thinks.** A `reasoning` item is
@@ -118,10 +128,26 @@ what neither the README nor the code will tell you.
 - The app's model menu lists Claude models only, so a Codex session reads
   "Unsupported model".
 - The app has its own `/` commands. It runs many itself (`/status`, `/usage`,
-  `/help`, `/config`), sends `/model <id>` as `set_model`, and passes others
-  on as the text of a user message (`/effort`, `/compact`, `/sandbox`). So a
-  message whose first word is a `/command` is never a prompt: the bridge runs
-  it or turns it away. Leaving one to the model spends a turn on nonsense.
+  `/help`, `/config`, `/diff`), sends `/model <id>` as `set_model`, and passes
+  others on as the text of a user message (`/effort`, `/compact`, `/sandbox`,
+  `/clear`, `/exit`, and any it does not know). So a message whose first word
+  is a `/command` is never a prompt: the bridge runs it or turns it away.
+  Leaving one to the model spends a turn on nonsense.
+- Some of the app's own never reach the bridge as text, so the bridge has no
+  command of that name: `/plan` is `set_permission_mode`, `/permissions`
+  opens the mode menu, `/rename <title>` retitles the session and sends
+  `rename_session`, `/tasks` opens the app's Background tasks panel, and
+  `/skills` and `/mcp` open the app's own settings.
+- The `/` menu lists the app's commands first and the session's
+  `slash_commands` after them, so the session's show once the list is
+  scrolled or a letter is typed.
+- `/clear` empties the transcript on a `conversation_reset` event
+  (`new_conversation_id`, `trigger: "clear"`, `user_message_uuid`). The app
+  then shows "No messages yet", and a session opened later shows only what
+  came after the event. The session and its title carry on.
+- An archived session reads "This session is archived" where the message box
+  was, with an Unarchive button. Unarchived by hand it is active and
+  disconnected until a bridge serves its thread again.
 - The Changes panel needs two things of a session. It must have been created
   with its GitHub repository (`create_session(repository=…)`), else the server
   tags it `config:no-git-repo`. And the worker must report
@@ -170,12 +196,24 @@ what neither the README nor the code will tell you.
   sends SIGTERM twice, the second as soon as the unit's main process has
   gone, so only the first one stops the bridge: the second, taken the same
   way, would land in the goodbye and cut it short.
+- A session that is only disconnected stays in the app's list of live
+  sessions until someone archives it. Claude Code archives its own as it
+  exits, and so does the bridge, after the goodbye: an archived session
+  refuses its worker's calls, and one archived first stays listed as
+  `connected`.
 
 ## Where state lives
 
 - Which session belongs to which thread is kept on the server, as the session
   tag `codex-thread:<thread id>`. A session's title says whether it was named:
   one starting with `Codex: ` follows its thread, any other is kept.
+- A bridge archives its session as it stops, whatever stopped it, unless
+  another worker took the seat. Serving a thread looks for its session among
+  the active ones first (one left by a bridge that was killed), then the
+  archived, and unarchives it.
+- `/clear` moves all of it to the new thread: the session's tag, the bridge's
+  record (renamed, so the lock is kept) and its log. The thread left has no
+  session after that, and serving it makes a new one.
 - Each running bridge holds a locked record in
   `~/.local/state/codex-remote-control/` (`$XDG_STATE_HOME`). The lock, not
   the pid in the record, is what says a bridge is alive. The record also says
@@ -189,6 +227,10 @@ what neither the README nor the code will tell you.
   with `num_turns: 0` and no turn id.
 - Files attached in the app are saved under `uploads/<thread id>/` in the
   state directory, and removed when the thread is closed.
+- What a wrapper reads is on stdout: `thread <id>  (<directory>)` first and
+  again after each `/clear`, and `exit     typed in the app` last when `/exit`
+  ended the bridge. The exit status does not tell `/exit` from a stop: both
+  are 0, so that a supervisor restarts neither.
 
 ## Testing against the real services
 
@@ -225,7 +267,10 @@ Codex plan and a real Claude account:
   `.venv/bin/codex-rc` and `.venv/bin/python -m pytest` directly.
 - To see what the app sends, run the bridge with `-v` and drive the session
   in a browser. As a controller, claude-rc-api's `request_control()` and
-  `send_message()` exercise most handlers without one.
+  `send_message()` exercise most handlers without one, commands included:
+  `send_message(sid, "/clear")` is what the app sends. Typing commands into
+  the app from a script is slow and misfires, since the `/` menu takes the
+  first Enter.
 - To see what the app draws for a sequence of events, no Codex is needed:
   serve a scratch session from a script built on claude-rc-api's
   `examples/echo_worker.py`, write the events by hand and watch the session

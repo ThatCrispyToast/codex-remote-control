@@ -31,17 +31,19 @@ from claude_rc import (
     WorkerEvicted,
     cli_control_cancel_request,
     worker_assistant,
+    worker_conversation_reset,
     worker_init,
     worker_initialize_response,
     worker_permission_request,
     worker_result,
+    worker_shutting_down,
     worker_status,
     worker_stream_event,
     worker_tool_result,
 )
 
 from . import background, translate, workspace
-from .appserver import AppServer, AppServerClosed, AppServerError
+from .appserver import AppServer, AppServerClosed, AppServerError, resume_command
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +62,11 @@ _THINK_AFTER_S = 1.0
 _COMPACTING_EVERY_S = 30.0
 # What a tool call and a turn still open when the bridge is stopped end as.
 _LEFT = "Remote Control was stopped before this finished."
+# What a command that needs the thread to itself answers while a turn runs.
+_BUSY = "Codex is in the middle of a turn. Try again when it is done."
+# The settings a thread started by `/clear` takes from the one it follows, as
+# `thread/settings/update` names them. The model goes in its `thread/start`.
+_CARRIED = ("effort", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "collaborationMode")
 # How much of a thread's history a session is given, to start with or to catch
 # up on: its latest turns, up to this many, and only as many items as the
 # second number allows. A turn left to work for hours can hold a thousand.
@@ -126,21 +133,41 @@ class ThreadClosed(Exception):
     """The Codex thread was closed or archived: there is nothing left to serve."""
 
 
+class Exited(Exception):
+    """`/exit` was typed in the app: the session is to end."""
+
+
 class Bridge:
-    def __init__(self, codex: AppServer, worker: RemoteControlWorker, opened: dict, *, follow_name: bool):
+    def __init__(
+        self, codex: AppServer, worker: RemoteControlWorker, opened: dict, *,
+        name: str | None = None, moved: Callable[[str, dict], None] | None = None,
+    ):
         """``opened`` is the result of the `thread/start` or `thread/resume`
-        that subscribed ``codex`` to the thread. With ``follow_name`` the
-        session is retitled as Codex names the thread."""
+        that subscribed ``codex`` to the thread. ``name`` is the name the
+        session was given; one given none is titled after its thread, and
+        retitled as Codex names that. ``moved`` is called when the session
+        goes over to another thread (`/clear`), with the id of the thread it
+        left and the thread it took up."""
         self.codex = codex
         self.worker = worker
-        self.thread: dict = opened["thread"]
-        self.thread_id: str = self.thread["id"]
-        self.follow_name = follow_name
-        self.settings = _settings(opened)
+        self.name = name
+        self.moved = moved
         self._models: dict[str, list[str]] | None = None  # see models()
         self.mcp: list[dict] = []  # Codex's MCP servers, as the app lists a session's
-        self.repository = workspace.repository(self.settings["cwd"])  # the checkout's GitHub repository and branch
         self.refused_models: set[str] = set()  # models asked for that Codex lacks, each explained once
+        self.allowed: set[str] = set()  # commands given "Always allow", which lasts as long as this bridge serves
+        self.watched = True  # whether a controller has the session open, by the last upload's ack
+        self.heard_at = 0.0  # when Codex or a controller last had something for the bridge
+        self._inbox: queue.Queue = queue.Queue()
+        self._take(opened)
+
+    def _take(self, opened: dict) -> None:
+        """Take up a thread: the one the bridge starts on, or the one `/clear`
+        starts. Nothing known of the thread before it holds for this one."""
+        self.thread: dict = opened["thread"]
+        self.thread_id: str = self.thread["id"]
+        self.settings = _settings(opened)
+        self.repository = workspace.repository(self.settings["cwd"])  # the checkout's GitHub repository and branch
         self.turn: str | None = None  # the running Codex turn
         self.last_turn: str | None = None  # the latest turn the thread has, running or not
         self.inputs: list[Event] = []  # the controller messages that turn answers
@@ -159,25 +186,26 @@ class Bridge:
         self.own_prompt = False  # the running turn was started by a command: its prompt is Codex's wording, not the user's
         self.review: str | None = None  # a review's findings, until the message that repeats them arrives
         self.prompts: dict[str, dict] = {}  # open permission prompts: request id -> the app-server request
-        self.allowed: set[str] = set()  # commands given "Always allow", which lasts as long as this bridge serves
         self.usage: dict | None = None  # the thread's token usage, as last reported
         self.usage_before: dict | None = None  # ... and as the running turn began
         self.last_text = ""  # the turn's latest agent message: its result
-        self.watched = True  # whether a controller has the session open, by the last upload's ack
         self.stream: str | None = None  # the message or thought being written, by item id
         self.stream_kind = "text"  # ... which of the two: "text" or "thinking"
         self.stream_open = False  # ... whether the watchers have its start
         self.stream_text = ""  # ... and its text not yet passed on to them
         self.stream_sent_at = 0.0
         self.thought: str | None = None  # the empty thought watchers see while the model thinks, by its id
-        self.heard_at = 0.0  # when Codex or a controller last had something for the bridge
-        self._inbox: queue.Queue = queue.Queue()
+
+    @property
+    def follow_name(self) -> bool:
+        """Whether the session is titled after its thread."""
+        return self.name is None
 
     # -- the loop ------------------------------------------------------------
     def run(self) -> None:
         """Serve until the worker seat is lost (:class:`claude_rc.WorkerEvicted`),
-        the thread closes (:class:`ThreadClosed`), or the app-server stays gone
-        (:class:`AppServerClosed`)."""
+        the thread closes (:class:`ThreadClosed`), `/exit` is typed in the app
+        (:class:`Exited`), or the app-server stays gone (:class:`AppServerClosed`)."""
         self.mcp = self._mcp_servers()
         self._announce()
         self._adopt_running_turn()
@@ -187,7 +215,7 @@ class Bridge:
                 self._pump("codex", self.codex.messages())
                 self._serve()  # returns when the app-server connection drops
                 self._reconnect()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, Exited):
             self._leave()
             raise
 
@@ -226,7 +254,7 @@ class Bridge:
                     self._from_codex(item)
             except AppServerClosed:
                 return
-            except (WorkerEvicted, ThreadClosed):
+            except (WorkerEvicted, ThreadClosed, Exited):
                 raise
             except Exception:
                 # One event that can't be passed on (a refused upload, a shape
@@ -262,19 +290,20 @@ class Bridge:
         threading.Thread(target=run, name="bridge-task", daemon=True).start()
 
     def _leave(self) -> None:
-        """Stopped mid-turn, the bridge will not see that turn end, and the
+        """The bridge is stopping, and says so as Claude Code does when it
+        exits. Stopped mid-turn, it will not see that turn end, and the
         `--stop` typed in a session always is mid-turn: it is a command in
         one. Close what the app shows as open. Codex carries on regardless."""
-        if self.turn is None:
-            return
         try:
-            for request_id in list(self.prompts):
-                self._withdraw_prompt(request_id)
-            for calls in self.calls.values():
-                self._send(*(worker_tool_result(call["id"], _LEFT) for call in calls))
-            self.worker.end_turn(*self.inputs, result=_LEFT, **{TURN_FIELD: self.turn})
+            if self.turn is not None:
+                for request_id in list(self.prompts):
+                    self._withdraw_prompt(request_id)
+                for calls in self.calls.values():
+                    self._send(*(worker_tool_result(call["id"], _LEFT) for call in calls))
+                self.worker.end_turn(*self.inputs, result=_LEFT, **{TURN_FIELD: self.turn})
+            self.worker.send(worker_shutting_down())
         except Exception:  # the stop goes ahead either way
-            log.debug("could not close the running turn", exc_info=True)
+            log.debug("could not close the session's transcript", exc_info=True)
 
     def _turns(self, limit: int, *, items: bool = False) -> list[dict]:
         """The thread's latest turns, newest first, with their items if asked.
@@ -537,7 +566,7 @@ class Bridge:
         passes the rest on as text, which Claude Code would run. None of them
         is a prompt, so none reaches the model: one this session has no
         answer to is turned away, as Codex's own terminal would."""
-        handler = self._COMMANDS.get(name)
+        handler = self._COMMANDS.get(self._ALIASES.get(name, name))
         if handler is None:
             known = ", ".join(f"`/{command}`" for command in sorted(self._COMMANDS))
             self._answer_here(message, f"`/{name}` isn't available on a Codex session. This one takes {known}.")
@@ -565,7 +594,7 @@ class Bridge:
         as a message waits on its turn. Returns what to answer instead if it
         can't be started."""
         if self.turn is not None:
-            return "Codex is in the middle of a turn. Try again when it is done."
+            return _BUSY
         self.sent.add(message.id)
         self.inputs = [message]
         self.worker.begin_turn(message)
@@ -616,19 +645,89 @@ class Bridge:
         except (AppServerError, TimeoutError):
             limits = None  # signed in with an API key, or offline: the rest still stands
         return translate.report(
-            thread=self.thread, settings=self.settings, usage=self.usage, rate_limits=limits, models=list(self.models()),
+            thread=self.thread, settings=self.settings, usage=self.usage, rate_limits=limits,
+            models=list(self.models()), resume=self._resume(self.thread_id),
         )
+
+    def _resume(self, thread_id: str) -> str:
+        return resume_command(self.codex.remote, thread_id)
+
+    def _clear_command(self, _: str, message: Event) -> str:
+        """Claude Code's `/clear`, Codex's `/new`: the session goes on with a
+        new thread, which starts as the last one stood (its directory, model,
+        effort, sandbox, approvals and mode) and knows nothing of it. The app
+        empties its transcript at the `conversation_reset`. The thread left
+        is kept, as Codex keeps every thread."""
+        if self.turn is not None:
+            return _BUSY
+        left, carried = self.thread_id, {key: self.settings[key] for key in _CARRIED if self.settings.get(key) is not None}
+        opened = self.codex.request("thread/start", {"cwd": self.settings["cwd"], "model": self.model})
+        thread = opened["thread"]
+        try:
+            self.codex.request("thread/settings/update", {"threadId": thread["id"], **carried})
+        except AppServerError as e:  # the thread stands, on the settings Codex gave it
+            log.warning("the new thread did not take the last one's settings: %s", e)
+            carried = {}
+        if self.name:  # which also writes it to disk, where a terminal can join it
+            self.codex.request("thread/name/set", {"threadId": thread["id"], "name": self.name})
+            thread["name"] = self.name
+        try:
+            self.codex.request("thread/unsubscribe", {"threadId": left})
+        except AppServerError as e:
+            log.debug("could not leave the last thread: %s", e)
+        self._take(opened)
+        self.settings.update(carried)
+        self._send(worker_conversation_reset(self.thread_id, user_message_uuid=message.id))
+        self.worker.report_metadata(context_usage=None)
+        if self.follow_name:  # titled after a thread that is no longer the session's
+            self.worker.client.rename_session(self.worker.session_id, session_title(None, self.settings["cwd"]))
+        if self.moved is not None:
+            self.moved(left, self.thread)
+        self._announce()
+        return f"Started a new thread. The last one is kept: `{self._resume(left)}`."
+
+    def _exit_command(self, _: str, message: Event) -> None:
+        """End the session: stop the running turn, say so, and leave. What
+        runs the bridge ends the session in the app as it goes."""
+        if self.turn is not None:
+            try:
+                self.codex.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn})
+            except AppServerError as e:  # over already
+                log.debug("could not stop the running turn: %s", e)
+        self._answer_here(message, f"Off Remote Control. The thread is kept: `{self._resume(self.thread_id)}`.")
+        raise Exited
+
+    def _terminals(self) -> list[dict]:
+        """The commands Codex left running in the background of this thread."""
+        return self.codex.request("thread/backgroundTerminals/list", {"threadId": self.thread_id})["data"]
+
+    def _ps_command(self, _: str, __: Event) -> str:
+        return translate.terminals(self._terminals())
+
+    def _stop_command(self, _: str, __: Event) -> str:
+        running = len(self._terminals())
+        if not running:
+            return "No background terminals are running."
+        self.codex.request("thread/backgroundTerminals/clean", {"threadId": self.thread_id})
+        return f"Stopped {running} background terminal{'s' if running > 1 else ''}."
 
     # Typed in the app's message box, these are answered here rather than
     # sent to the model. The app adds them to its own in its `/` menu.
     _COMMANDS: ClassVar[dict[str, Callable[[Bridge, str, Event], str | None]]] = {
-        "model": _model_command,
-        "effort": _effort_command,
+        "clear": _clear_command,
+        "codex": _codex_command,
         "compact": _compact_command,
+        "effort": _effort_command,
+        "exit": _exit_command,
+        "model": _model_command,
+        "ps": _ps_command,
         "review": _review_command,
         "sandbox": _sandbox_command,
-        "codex": _codex_command,
+        "stop": _stop_command,
     }
+    # Codex's own names for what the app knows by Claude Code's, and Claude
+    # Code's other names for its own. Typed, they work; the menu lists neither.
+    _ALIASES: ClassVar[dict[str, str]] = {"new": "clear", "reset": "clear", "quit": "exit"}
 
     # -- control requests: what the app's menus and panels ask ------------------
     def _control_request(self, request: Event) -> None:

@@ -56,6 +56,11 @@ def remote_socket(remote: str) -> str:
     return path
 
 
+def resume_command(remote: str | None, thread_id: str) -> str:
+    """What opens a thread in a Codex terminal, on the app-server it is served from."""
+    return f"codex{f' --remote {remote}' if remote else ''} resume {thread_id}"
+
+
 class AppServer:
     """One connection to the daemon, or with ``remote`` (``unix://PATH``) to the
     app-server listening there. :meth:`request` may be called from any thread;

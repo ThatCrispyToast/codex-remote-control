@@ -63,6 +63,17 @@ class Record:
         json.dump(self._info, self._file)
         self._file.flush()
 
+    def move(self, thread_id: str) -> None:
+        """Go over to another thread with the bridge (`/clear` starts one): the
+        record is found by the thread it is named for. Renamed, the file stays
+        the one this process holds locked. A background bridge's log goes too."""
+        path = _path(thread_id)
+        os.replace(self.path, path)
+        log = self.path.with_suffix(".log")
+        if log.exists():
+            os.replace(log, path.with_suffix(".log"))
+        self.path = path
+
     def close(self) -> None:
         self.path.unlink(missing_ok=True)
         self._file.close()

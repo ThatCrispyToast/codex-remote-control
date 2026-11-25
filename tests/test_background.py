@@ -43,6 +43,19 @@ def test_a_bridge_holds_its_threads_record_while_it_runs(state):
     assert not list(state.iterdir())
 
 
+def test_a_record_follows_its_bridge_to_another_thread_with_its_log(state):
+    record = background.claim(THREAD)
+    (state / f"{THREAD}.log").write_text("started\n")
+    record.move("thr-2")
+    record.update(state="idle")
+    assert background.running(THREAD) is None
+    assert background.running("thr-2")["state"] == "idle"
+    assert sorted(path.name for path in state.iterdir()) == ["thr-2.json", "thr-2.log"]
+    assert list(background.bridges()) == ["thr-2"]
+    record.close()
+    (state / "thr-2.log").unlink()
+
+
 def test_a_record_left_behind_is_no_bridge(state):
     state.mkdir()
     (state / f"{THREAD}.json").write_text('{"pid": 1, "session": "https://claude.ai/code/session_0"}')

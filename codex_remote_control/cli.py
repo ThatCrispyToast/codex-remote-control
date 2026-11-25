@@ -20,8 +20,10 @@ from claude_rc import (
 )
 
 from . import __version__, background, workspace
-from .appserver import AppServer, AppServerClosed, AppServerError, remote_socket
-from .bridge import TITLE_PREFIX, Bridge, ThreadClosed, session_title
+from .appserver import AppServer, AppServerClosed, AppServerError, remote_socket, resume_command
+from .bridge import TITLE_PREFIX, Bridge, Exited, ThreadClosed, session_title
+
+log = logging.getLogger(__name__)
 
 # The session tag that ties a Remote Control session to its Codex thread, so
 # serving a thread again finds its session instead of making another.
@@ -104,12 +106,21 @@ def open_session(rc: RemoteControlClient, thread: dict, name: str | None) -> tup
     """The Remote Control session for a thread: its id, its title, whether it
     is new, and whether the title follows the thread's name.
 
-    A thread served before gets the same session again, if that is still
-    active. A session keeps the name it was given, here or in the app, until
-    it is given another; one never named is titled after its thread."""
+    A thread served before gets the same session again. A bridge ends its
+    session as it stops, so that is usually an archived one, reopened here;
+    one still active was left by a bridge that was killed. A session keeps
+    the name it was given, here or in the app, until it is given another; one
+    never named is titled after its thread."""
     tag = THREAD_TAG + thread["id"]
     after_thread = session_title(thread.get("name"), thread["cwd"])
-    for session in rc.sessions(tags=tag, statuses="active"):
+    served = rc.sessions(tags=tag)  # newest first, archived ones among them
+    for session in [s for s in served if s.get("status") != "archived"] or served[:1]:
+        if session.get("status") == "archived":
+            try:
+                rc.unarchive_session(session["id"])
+            except APIError as e:  # gone for good: the thread gets a new one
+                log.warning("could not reopen the thread's session: %s", e)
+                break
         current = session.get("title") or ""
         named = name is not None or (current != "" and not current.startswith(TITLE_PREFIX))
         title = name or (current if named else after_thread)
@@ -126,13 +137,28 @@ def session_url(session_id: str) -> str:
     return f"https://claude.ai/code/{session_id.replace('cse_', 'session_', 1)}"
 
 
+def follow(rc: RemoteControlClient, session_id: str, record: background.Record, remote: str | None, left: str, thread: dict) -> None:
+    """The session went over to a new thread (`/clear`): what ties it to its
+    thread goes over too. Its tag, so that serving the new thread finds this
+    session and serving the one it left does not; the bridge's record, which
+    is found by its thread; and for a script that wraps the command, the
+    `thread` line again."""
+    record.move(thread["id"])
+    print(f"thread   {thread['id']}  ({thread['cwd']})")
+    print(f"tui      {resume_command(remote, thread['id'])}", flush=True)
+    try:
+        rc.update_session(session_id, add_tags=[THREAD_TAG + thread["id"]], remove_tags=[THREAD_TAG + left])
+    except (APIError, httpx.HTTPError) as e:  # served all the same: only finding it again is at stake
+        log.warning("could not tie the session to its new thread: %s", e)
+
+
 def on_sigterm(signum: int, frame) -> None:
-    """Stop on SIGTERM as on Ctrl-C, so the session says goodbye either way,
-    and on the first one only. Stopping a unit, systemd sends a second SIGTERM
-    to what is left as soon as the unit's main process has gone: taken like
-    the first, it cuts the goodbye short, and the app shows the session
-    connected until its heartbeats lapse. The SIGKILL that ends a stop that
-    times out still ends a goodbye that hangs."""
+    """Stop on SIGTERM as on Ctrl-C, so the session says goodbye and ends
+    either way, and on the first one only. Stopping a unit, systemd sends a
+    second SIGTERM to what is left as soon as the unit's main process has
+    gone: taken like the first, it cuts the goodbye short, and the app shows
+    the session connected until its heartbeats lapse. The SIGKILL that ends a
+    stop that times out still ends a goodbye that hangs."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise KeyboardInterrupt
 
@@ -208,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         "session from the background; anywhere else it runs until interrupted.",
     )
     parser.add_argument("name", nargs="*", help='the session\'s name in claude.ai (default: "Codex: " and the thread\'s name, or its directory)')
-    parser.add_argument("--stop", action="store_true", help="take the thread off Remote Control (outside a Codex session: the only one on it, or the one --thread names)")
+    parser.add_argument("--stop", action="store_true", help="take the thread off Remote Control, which ends its session in Claude (outside a Codex session: the only one on it, or the one --thread names)")
     parser.add_argument("--list", action="store_true", help="list the threads on Remote Control from this machine")
     parser.add_argument("--thread", metavar="ID", help="the thread to serve, by the id `codex resume` takes (default: the session this is typed in, else a new thread)")
     parser.add_argument("--last", action="store_true", help="serve the directory's most recent thread")
@@ -276,12 +302,27 @@ def main(argv: list[str] | None = None) -> int:
         session_id, title, new_session, follow_name = open_session(rc, thread, args.name)
         record.update(session=session_url(session_id), title=title, cwd=opened["cwd"])
         print(f"session  {session_url(session_id)}  ({title})")
-        print(f"tui      codex{f' --remote {args.remote}' if args.remote else ''} resume {thread['id']}", flush=True)
-        with RecordedWorker(record, rc, session_id) as worker:
-            bridge = Bridge(codex, worker, opened, follow_name=follow_name)
+        print(f"tui      {resume_command(args.remote, thread['id'])}", flush=True)
+        worker = RecordedWorker(record, rc, session_id)
+        try:
+            worker.connect()
+            bridge = Bridge(
+                codex, worker, opened, name=None if follow_name else title,
+                moved=lambda left, thread: follow(rc, session_id, record, args.remote, left, thread),
+            )
             bridge.backfill(new=new_session)
             bridge.run()
+        finally:
+            # However the bridge stops, its session ends with it, as Claude
+            # Code's does: archived, not left listed as disconnected. Serving
+            # the thread again reopens it.
+            worker.close(archive=True)
     except KeyboardInterrupt:
+        return 0
+    except Exited:
+        # For a script that wraps the command and runs Codex beside it: the
+        # one way of stopping that asks for all of it to end.
+        print("exit     typed in the app", flush=True)
         return 0
     except ThreadClosed:
         print("the Codex thread was closed", file=sys.stderr)

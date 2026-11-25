@@ -26,7 +26,8 @@ Open the link it prints, or pick the session under **Remote Control** in Claude.
 - Commands, edits and approval requests in the chat, and Codex's questions to
   answer there
 - Changes and Files panels, `@` file mentions, attachments, `/btw` side questions
-- Model, reasoning effort, compaction and review as slash commands
+- Slash commands: a fresh thread, ending the session, model, reasoning effort,
+  compaction, review, background terminals
 - Terminal and Claude on the same thread at once
 
 ## Installation
@@ -44,7 +45,7 @@ login shell's PATH.
 # In Codex
 !codex-rc                              # put this session on Remote Control
 !codex-rc My Project                   # same, under a name that survives reconnects
-!codex-rc --stop                       # take it off; !codex-rc reopens the same session
+!codex-rc --stop                       # take it off, ending its session; !codex-rc reopens it
 
 # From a shell: prints the session link, runs until Ctrl-C
 codex-rc                               # new thread in this directory
@@ -71,9 +72,17 @@ codex-rc --stop --thread <thread-id>   # stop that one
   joins it with `codex --remote unix://PATH`. `$CODEX_RC_REMOTE` sets the
   default. Put it in that app-server's environment and every command it runs
   has it, `!codex-rc` included.
-- From a shell its first line is `thread <thread-id>  (<directory>)`, printed
-  before claude.ai is asked, for a script that wraps it.
+- A session lasts as long as its bridge. However the bridge stops (`--stop`,
+  Ctrl-C, a signal, `/exit`), the session is archived in Claude, not left
+  listed as disconnected. Serving the thread again reopens that session, with
+  its transcript and its name.
 - Archiving the session in Claude stops the bridge.
+- From a shell its first line is `thread <thread-id>  (<directory>)`, printed
+  before claude.ai is asked, for a script that wraps it. The line comes again
+  when `/clear` moves the session to a new thread. When `/exit` is typed in
+  Claude the last line is `exit     typed in the app`, so a script that runs
+  Codex beside the bridge can end that too. The exit status is 0 either way,
+  as for any stop that was asked for, and 1 after a failure.
 - In a side conversation, `!codex-rc` serves the thread it came from. A temporary
   one can't tell which that is, and says to type it in the main thread.
 
@@ -83,13 +92,21 @@ Typed in the chat box:
 
 | Command | Action |
 | --- | --- |
+| `/clear` | Start a new thread in the same session, with the same directory, model and mode. The old thread is kept. Also `/new` |
+| `/exit` | Stop the running turn, take the thread off Remote Control and end the session. Also `/quit` |
 | `/model <id>` | Change the Codex model |
 | `/effort [level]` | Show or change reasoning effort |
 | `/compact` | Compact the thread's context |
 | `/review [instructions]` | Review the uncommitted changes, or what you describe |
 | `/btw <question>` | Ask a side question without adding to the thread |
+| `/ps` | List the commands Codex left running in background terminals |
+| `/stop` | Stop those background terminals |
 | `/codex` | Show model, sandbox, context, Codex usage limits and thread id |
 | `/sandbox` | Show the sandbox and approval settings |
+
+`/plan`, `/permissions` and `/rename` are Claude's own and work as they do on a
+Claude session. A terminal open on the thread stays where it is: after `/clear`
+it is still on the old thread, and after `/exit` it is still running.
 
 The mode menu:
 
@@ -107,12 +124,14 @@ Approval cards offer **Deny** and **Allow once**. A command's card adds
 
 - Unofficial. Uses Anthropic's private Remote Control protocol and the
   experimental Codex app-server API. Tested with Codex 0.170.0 and
-  claude.ai/code on 2026-11-20.
+  claude.ai/code on 2026-11-25.
 - A Codex started with `-c`, `--enable`, `--disable` or `--search` can't be
   joined ("already has an active writer").
 - The model picker lists Claude models only and reads "Unsupported model".
   Use `/model`.
 - **Stop** ends the turn, but a shell command already running can carry on.
+  `/stop` ends the ones Codex put in background terminals.
+- Claude's `/skills` and `/mcp` open Claude's own settings, not Codex's.
 - **Changes** needs a checkout of a GitHub repository.
 - MCP forms with text fields have to be answered in the Codex terminal.
 - No rewind, file undo, forks, or adding MCP servers from Claude.

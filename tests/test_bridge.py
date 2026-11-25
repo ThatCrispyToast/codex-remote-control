@@ -8,7 +8,7 @@ from claude_rc import APIError, Event
 from codex_remote_control import bridge as bridge_module
 from codex_remote_control import workspace
 from codex_remote_control.appserver import AppServerClosed, AppServerError
-from codex_remote_control.bridge import Bridge, ThreadClosed, session_title
+from codex_remote_control.bridge import Bridge, Exited, ThreadClosed, session_title
 
 THREAD = "thr-1"
 OPENED = {
@@ -25,6 +25,8 @@ MODELS = {"data": [
 
 class Codex:
     """Records the bridge's requests and answers; `refuse` names methods to fail."""
+
+    remote = None  # the shared daemon
 
     def __init__(self):
         self.requests, self.answers, self.refuse = [], [], set()
@@ -93,7 +95,7 @@ class Worker:
 
 @pytest.fixture
 def bridge():
-    return Bridge(Codex(), Worker(), OPENED, follow_name=True)
+    return Bridge(Codex(), Worker(), OPENED)
 
 
 @pytest.fixture(autouse=True)
@@ -233,7 +235,7 @@ def test_a_thread_taken_up_mid_turn_can_be_stopped(bridge):
     bridge._from_controller(control("interrupt"))
     assert bridge.codex.sent("turn/interrupt") == [{"threadId": THREAD, "turnId": "turn-7"}]
     bridge.codex.results["thread/turns/list"] = {"data": [{"id": "turn-8", "status": "completed", "items": []}]}
-    idle = Bridge(Codex(), Worker(), OPENED, follow_name=True)
+    idle = Bridge(Codex(), Worker(), OPENED)
     idle._adopt_running_turn()
     assert idle.turn is None and idle.worker.log == []
 
@@ -630,15 +632,114 @@ def test_slash_commands_are_answered_without_a_turn(bridge):
 
 def test_a_command_this_session_lacks_never_reaches_the_model(bridge):
     """The app passes on the commands it doesn't run itself, as text."""
-    bridge._from_controller(user("/clear"))
+    bridge._from_controller(user("/fast"))
     bridge._from_controller(user("/Frobnicate now", seq=2))
     said = [event["message"]["content"][0]["text"] for event in bridge.worker.events()]
-    assert said[0].startswith("`/clear` isn't available on a Codex session. This one takes `/codex`, `/compact`")
+    assert said[0].startswith("`/fast` isn't available on a Codex session. This one takes `/clear`, `/codex`, `/compact`")
     assert said[1].startswith("`/frobnicate` isn't available")
     assert bridge.codex.sent("turn/start") == []
     bridge._from_controller(user("/tmp is full, what can go?", seq=3))  # a path, not a command
     bridge._from_controller(user("/tmp/x.log\nis huge", uuid="u-2", seq=4))
     assert len(bridge.codex.sent("turn/start")) + len(bridge.codex.sent("turn/steer")) == 2
+
+
+NEW = {**OPENED, "thread": {"id": "thr-2", "cwd": "/w", "name": None}, "reasoningEffort": "medium",
+       "approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"}}  # as Codex starts one: on its defaults
+
+
+def test_clear_starts_a_thread_and_empties_the_transcript(bridge):
+    """Claude Code's `/clear`: the session goes on, with nothing of the conversation before."""
+    moved = []
+    bridge.moved = lambda left, thread: moved.append((left, thread["id"]))
+    bridge.codex.results["thread/start"] = NEW
+    bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 1500}}))
+    bridge._from_controller(user("/clear"))
+    assert bridge.codex.sent("thread/start") == [{"cwd": "/w", "model": "gpt-x"}]
+    assert bridge.codex.sent("thread/unsubscribe") == [{"threadId": THREAD}]
+    assert (bridge.thread_id, bridge.usage, moved) == ("thr-2", None, [(THREAD, "thr-2")])
+    reset, init, said = bridge.worker.events()
+    assert (reset["type"], reset["new_conversation_id"], reset["user_message_uuid"]) == ("conversation_reset", "thr-2", "u-1")
+    assert said["message"]["content"][0]["text"] == "Started a new thread. The last one is kept: `codex resume thr-1`."
+    assert bridge.worker.calls("report_metadata")[0] == ({"context_usage": None},)
+    assert bridge.worker.calls("title") == [("Codex: w",)]  # no longer titled after the thread it left
+    assert bridge.worker.calls("end_turn")[-1][-1]["num_turns"] == 0
+    bridge._from_codex(note("turn/started", turn={"id": "turn-9"}))  # the thread it left: not this session's any more
+    assert bridge.turn is None
+    bridge._from_controller(user("hello", uuid="u-2", seq=2))
+    assert bridge.codex.sent("turn/start")[0]["threadId"] == "thr-2"
+
+
+def test_the_new_thread_starts_as_the_last_one_stood(bridge):
+    """Its mode, sandbox and effort were set in the app, and a `/clear` is no reason to lose them."""
+    bridge.codex.results["thread/start"] = NEW
+    bridge._from_controller(user("/new"))  # Codex's name for it
+    assert bridge.codex.sent("thread/settings/update") == [{
+        "threadId": "thr-2", "effort": "low", "approvalPolicy": "on-request", "approvalsReviewer": "user",
+        "sandboxPolicy": {"type": "readOnly"}, "collaborationMode": {"mode": "default"}}]
+    init = bridge.worker.events()[1]
+    assert (init["subtype"], init["permissionMode"], init["effort"]) == ("init", "default", "low")
+    refused = Bridge(Codex(), Worker(), OPENED)
+    refused.codex.results["thread/start"] = NEW
+    refused.codex.refuse.add("thread/settings/update")
+    refused._from_controller(user("/clear"))
+    assert refused.worker.events()[1]["permissionMode"] == "bypassPermissions"  # what Codex gave it, said as it is
+
+
+def test_a_named_sessions_new_thread_takes_the_name(bridge):
+    """Which is what writes it to disk, where a terminal can join it."""
+    pinned = Bridge(Codex(), Worker(), OPENED, name="Agent")
+    pinned.codex.remote = "unix:///run/agent/app.sock"
+    pinned.codex.results["thread/start"] = NEW
+    pinned._from_controller(user("/clear"))
+    assert pinned.codex.sent("thread/name/set") == [{"threadId": "thr-2", "name": "Agent"}]
+    assert pinned.worker.calls("title") == []  # the session keeps its name
+    assert "`codex --remote unix:///run/agent/app.sock resume thr-1`" in pinned.worker.events()[-1]["message"]["content"][0]["text"]
+
+
+def test_clear_waits_for_the_running_turn_and_a_thread_codex_will_not_start_changes_nothing(bridge):
+    bridge.codex.refuse.add("thread/start")
+    bridge._from_controller(user("/clear"))
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "Codex refused: thread/start: no"
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
+    bridge._from_controller(user("/clear", seq=2))
+    assert "middle of a turn" in bridge.worker.events()[-1]["message"]["content"][0]["text"]
+    assert bridge.thread_id == THREAD and bridge.turn == "turn-1"
+
+
+def test_exit_says_so_and_ends_the_bridge(bridge):
+    with pytest.raises(Exited):
+        bridge._from_controller(user("/exit"))
+    assert bridge.worker.events()[0]["message"]["content"][0]["text"] == (
+        "Off Remote Control. The thread is kept: `codex resume thr-1`.")
+    assert bridge.worker.calls("end_turn")[0][-1]["num_turns"] == 0  # answered, so not delivered again
+    assert bridge.codex.sent("turn/interrupt") == []
+
+
+def test_exit_mid_turn_stops_the_turn(bridge):
+    bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
+    with pytest.raises(Exited):
+        bridge._from_controller(user("/quit"))  # Codex's name for it
+    assert bridge.codex.sent("turn/interrupt") == [{"threadId": THREAD, "turnId": "turn-1"}]
+    bridge._leave()  # as the loop does on its way out
+    assert bridge.worker.calls("end_turn")[-1][-1]["codex_turn"] == "turn-1"
+    assert bridge.worker.events()[-1]["subtype"] == "worker_shutting_down"
+
+
+def test_background_terminals_are_listed_and_stopped(bridge):
+    """The app's Stop ends the turn, and what Codex left running in the background runs on."""
+    bridge.codex.results["thread/backgroundTerminals/list"] = {"data": []}
+    bridge._from_controller(user("/ps"))
+    bridge._from_controller(user("/stop", seq=3))
+    assert [e["message"]["content"][0]["text"] for e in bridge.worker.events()[-2:]] == ["No background terminals are running."] * 2
+    assert bridge.codex.sent("thread/backgroundTerminals/clean") == []
+    bridge.codex.results["thread/backgroundTerminals/list"] = {"data": [
+        {"itemId": "i1", "processId": "p1", "command": "bash -lc 'npm run dev'", "cwd": "/w"}]}
+    bridge._from_controller(user("/ps", seq=4))
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"].splitlines() == [
+        "**Background terminals** (`/stop` ends them)", "- `npm run dev` in `/w`"]
+    bridge._from_controller(user("/stop", seq=5))
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "Stopped 1 background terminal."
+    assert bridge.codex.sent("thread/backgroundTerminals/clean") == [{"threadId": THREAD}]
 
 
 def test_the_codex_command_reports_what_the_apps_cards_leave_out(bridge):
@@ -952,7 +1053,7 @@ def test_the_session_takes_the_threads_name(bridge):
     bridge._from_codex(note("thread/name/updated", threadName="Fix the parser"))
     assert bridge.worker.calls("title") == [("Codex: Fix the parser",)]
     assert session_title(None, "/home/me/project") == "Codex: project"
-    pinned = Bridge(Codex(), Worker(), OPENED, follow_name=False)
+    pinned = Bridge(Codex(), Worker(), OPENED, name="Pinned")
     pinned._from_codex(note("thread/name/updated", threadName="Fix the parser"))
     assert pinned.worker.log == []
 
@@ -964,15 +1065,17 @@ def test_a_closed_thread_ends_the_bridge(bridge):
 
 def test_stopping_mid_turn_closes_what_the_app_shows_as_open(bridge):
     bridge._leave()
-    assert bridge.worker.log == []  # idle: nothing to close
+    left = {"type": "system", "subtype": "worker_shutting_down", "reason": "host_exit"}
+    assert bridge.worker.log == [("event", left)]  # idle: nothing to close, only to say it is leaving
     bridge._from_codex(note("turn/started", turn={"id": "turn-1"}))
     bridge._from_codex(item("started", **COMMAND))  # `codex-rc --stop`, say
     bridge._leave()
-    call = bridge.worker.events()[0]["message"]["content"][0]
-    closed = bridge.worker.events()[1]["message"]["content"][0]
+    call = bridge.worker.events()[1]["message"]["content"][0]
+    closed = bridge.worker.events()[2]["message"]["content"][0]
     assert (closed["type"], closed["tool_use_id"]) == ("tool_result", call["id"])
     assert "stopped" in closed["content"]
     assert bridge.worker.calls("end_turn")[-1][-1]["result"] == closed["content"]
+    assert bridge.worker.events()[-1] == left
 
 
 def turn(n, status="completed"):
@@ -1027,7 +1130,7 @@ def test_a_long_history_is_cut_to_the_latest_turns_it_has_room_for(bridge, monke
 
     # The latest turn is written whatever its size.
     monkeypatch.setattr(bridge_module, "_BACKFILL_ITEMS", 2)
-    fresh = Bridge(Codex(), Worker(), OPENED, follow_name=True)
+    fresh = Bridge(Codex(), Worker(), OPENED)
     fresh.codex.results["thread/turns/list"] = {"data": [long_turn(2, 40), turn(1)]}
     fresh.backfill(new=True)
     assert [event["codex_turn"] for event in fresh.worker.events() if event["type"] == "result"] == ["t2"]
