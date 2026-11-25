@@ -66,7 +66,9 @@ _LEFT = "Remote Control was stopped before this finished."
 _BUSY = "Codex is in the middle of a turn. Try again when it is done."
 # The settings a thread started by `/clear` takes from the one it follows, as
 # `thread/settings/update` names them. The model goes in its `thread/start`.
-_CARRIED = ("effort", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "collaborationMode")
+_CARRIED = ("effort", "serviceTier", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "collaborationMode")
+# The service tier that is Codex's Fast mode, and the one that is standard speed.
+_FAST, _STANDARD = "priority", "default"
 # How much of a thread's history a session is given, to start with or to catch
 # up on: its latest turns, up to this many, and only as many items as the
 # second number allows. A turn left to work for hours can hold a thousand.
@@ -109,6 +111,7 @@ def _settings(opened: dict) -> dict:
     return {
         "model": opened["model"],
         "effort": opened.get("reasoningEffort"),
+        "serviceTier": opened.get("serviceTier"),
         "cwd": opened["cwd"],
         "approvalPolicy": opened["approvalPolicy"],
         "approvalsReviewer": opened.get("approvalsReviewer", "user"),
@@ -152,7 +155,7 @@ class Bridge:
         self.worker = worker
         self.name = name
         self.moved = moved
-        self._models: dict[str, list[str]] | None = None  # see models()
+        self._models: dict[str, dict] | None = None  # see models()
         self.mcp: list[dict] = []  # Codex's MCP servers, as the app lists a session's
         self.refused_models: set[str] = set()  # models asked for that Codex lacks, each explained once
         self.allowed: set[str] = set()  # commands given "Always allow", which lasts as long as this bridge serves
@@ -430,13 +433,19 @@ class Bridge:
     def mode(self) -> str:
         return translate.permission_mode(self.settings)
 
+    @property
+    def fast(self) -> bool:
+        """Whether the thread is in Codex's Fast mode."""
+        return self.settings.get("serviceTier") == _FAST
+
     def _announce(self) -> None:
         """Tell the controllers the session's settings: `system/init`, which
         they read the model, mode and effort from."""
         effort = self.settings.get("effort")
         self.worker.send(worker_init(
             model=self.model, cwd=self.settings["cwd"], permission_mode=self.mode,
-            slash_commands=sorted(self._COMMANDS), mcp_servers=self.mcp, **({"effort": effort} if effort else {}),
+            slash_commands=sorted(self._COMMANDS), mcp_servers=self.mcp, fast_mode_state="on" if self.fast else "off",
+            **({"effort": effort} if effort else {}),
         ))
         self.worker.report_metadata(
             model=self.model, effort_level=effort, permission_mode=self.mode,
@@ -446,14 +455,15 @@ class Bridge:
             **({"current_branches": {self.repository[0]: self.repository[1]}} if self.repository and self.repository[1] else {}),
         )
 
-    def models(self) -> dict[str, list[str]]:
-        """Codex's models, each with the reasoning efforts it takes."""
+    def models(self) -> dict[str, dict]:
+        """Codex's models by id, each as `model/list` describes it."""
         if self._models is None:
-            self._models = {
-                m["id"]: [e["reasoningEffort"] for e in m["supportedReasoningEfforts"]]
-                for m in self.codex.request("model/list", {})["data"]
-            }
+            self._models = {m["id"]: m for m in self.codex.request("model/list", {})["data"]}
         return self._models
+
+    def efforts(self) -> list[str]:
+        """The reasoning efforts the thread's model takes."""
+        return [e["reasoningEffort"] for e in self.models().get(self.model, {}).get("supportedReasoningEfforts", [])]
 
     def _mcp_servers(self) -> list[dict]:
         """Codex's MCP servers and whether each is up, for the app's status card."""
@@ -484,9 +494,9 @@ class Bridge:
 
     def _settings_updated(self, params: dict) -> None:
         """The thread's settings changed, here or at a TUI."""
-        was = (self.model, self.mode, self.settings.get("effort"), self.settings["cwd"])
+        was = (self.model, self.mode, self.settings.get("effort"), self.fast, self.settings["cwd"])
         self.settings = params["threadSettings"]
-        if was != (self.model, self.mode, self.settings.get("effort"), self.settings["cwd"]):
+        if was != (self.model, self.mode, self.settings.get("effort"), self.fast, self.settings["cwd"]):
             self._announce()
 
     def _update_settings(self, **fields: Any) -> None:
@@ -617,13 +627,30 @@ class Bridge:
         return f"Model set to `{model}`, from the next turn."
 
     def _effort_command(self, effort: str, _: Event) -> str:
-        efforts = self.models().get(self.model, [])
+        efforts = self.efforts()
         if not effort:
             return f"Reasoning effort: `{self.settings.get('effort')}`. `{self.model}` takes: {', '.join(efforts)}."
         if effort not in efforts:
             return f"`{self.model}` has no effort `{effort}`. It takes: {', '.join(efforts)}."
         self._update_settings(effort=effort)
         return f"Reasoning effort set to `{effort}`, from the next turn."
+
+    def _fast_command(self, argument: str, _: Event) -> str:
+        """Claude Code's `/fast`, and Codex's: Fast mode on or off, or the
+        other of the two when it is not said which. In Codex it is a service
+        tier of the model, which says what it gives and what it costs."""
+        on = {"": not self.fast, "on": True, "off": False}.get(argument)
+        if on is None:
+            return "`/fast` takes `on` or `off`."
+        if not on:
+            self._update_settings(serviceTier=_STANDARD)
+            return "Fast mode off, from the next turn."
+        tiers = self.models().get(self.model, {}).get("serviceTiers", [])
+        tier = next((tier for tier in tiers if tier["id"] == _FAST), None)
+        if tier is None:
+            return f"`{self.model}` has no Fast mode."
+        self._update_settings(serviceTier=_FAST)
+        return f"Fast mode on, from the next turn: {tier['description']}."
 
     def _compact_command(self, _: str, message: Event) -> str | None:
         if self.last_turn is None:
@@ -645,7 +672,7 @@ class Bridge:
         except (AppServerError, TimeoutError):
             limits = None  # signed in with an API key, or offline: the rest still stands
         return translate.report(
-            thread=self.thread, settings=self.settings, usage=self.usage, rate_limits=limits,
+            thread=self.thread, settings=self.settings, fast=self.fast, usage=self.usage, rate_limits=limits,
             models=list(self.models()), resume=self._resume(self.thread_id),
         )
 
@@ -655,9 +682,9 @@ class Bridge:
     def _clear_command(self, _: str, message: Event) -> str:
         """Claude Code's `/clear`, Codex's `/new`: the session goes on with a
         new thread, which starts as the last one stood (its directory, model,
-        effort, sandbox, approvals and mode) and knows nothing of it. The app
-        empties its transcript at the `conversation_reset`. The thread left
-        is kept, as Codex keeps every thread."""
+        effort, speed, sandbox, approvals and mode) and knows nothing of it.
+        The app empties its transcript at the `conversation_reset`. The thread
+        left is kept, as Codex keeps every thread."""
         if self.turn is not None:
             return _BUSY
         left, carried = self.thread_id, {key: self.settings[key] for key in _CARRIED if self.settings.get(key) is not None}
@@ -719,6 +746,7 @@ class Bridge:
         "compact": _compact_command,
         "effort": _effort_command,
         "exit": _exit_command,
+        "fast": _fast_command,
         "model": _model_command,
         "ps": _ps_command,
         "review": _review_command,
@@ -781,7 +809,7 @@ class Bridge:
 
     def _apply_flag_settings(self, request: Event, fields: dict) -> None:
         level = (fields.get("settings") or {}).get("effortLevel")
-        efforts = self.models().get(self.model, [])
+        efforts = self.efforts()
         if level and level not in efforts:
             self.worker.reject(request, f"`{self.model}` has no effort {level!r}. It takes: {', '.join(efforts)}")
             return

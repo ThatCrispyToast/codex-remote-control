@@ -603,7 +603,8 @@ def terminals(running: list[dict]) -> str:
 
 
 def report(
-    *, thread: dict, settings: dict, usage: dict | None, rate_limits: dict | None, models: list[str], resume: str,
+    *, thread: dict, settings: dict, fast: bool, usage: dict | None, rate_limits: dict | None, models: list[str],
+    resume: str,
 ) -> str:
     """What `/codex` answers: the Codex side of the session, which the app's
     own status and usage cards (they describe the Claude account) leave out."""
@@ -611,7 +612,7 @@ def report(
     lines = [
         f"**Codex {thread.get('cliVersion') or ''}**".replace(" **", "**"),
         f"- Thread: `{thread['id']}` in `{settings['cwd']}`",
-        f"- Model: `{settings['model']}`" + (f", effort `{effort}`" if effort else ""),
+        f"- Model: `{settings['model']}`" + (f", effort `{effort}`" if effort else "") + (", Fast mode" if fast else ""),
         f"- {sandbox(settings)}",
     ]
     used = ((usage or {}).get("last") or {}).get("totalTokens")

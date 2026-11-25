@@ -97,6 +97,13 @@ what neither the README nor the code will tell you.
   `thread/name/set` like any other. That is how `/clear` makes its new thread
   stand as the old one stood. `thread/unsubscribe` answers `unsubscribed` and
   ends the old thread's notifications.
+- **Fast mode is a service tier** (0.172.0). `model/list` gives each model
+  its `serviceTiers`, and the one with id `priority` is the one Codex calls
+  Fast, with what it gives and costs as its `description` ("2x speed,
+  increased usage"). A thread's `serviceTier` is `priority` for Fast and
+  `default` for standard speed, set with `thread/settings/update` for the
+  turns after. `fast` is taken for `priority`. Any other string is taken as
+  it is, unchecked, like a model id.
 - The TUI's own `/new` and `/clear` move that TUI to a new thread. Nothing in
   the app-server moves a TUI from outside, so a terminal on the thread stays
   on the old one after the bridge's `/clear`.
@@ -133,6 +140,13 @@ what neither the README nor the code will tell you.
   `/clear`, `/exit`, and any it does not know). So a message whose first word
   is a `/command` is never a prompt: the bridge runs it or turns it away.
   Leaving one to the model spends a turn on nonsense.
+- `/fast` is the app's own name too, but one it runs only for a session
+  that lists `fast` among its `slash_commands`. Then it offers `/fast
+  [on|off]` and sends what was typed as text. For a session that does not
+  list it the app answers "/fast isn't a command here." and sends nothing.
+  A Claude Code worker reports the mode as `fast_mode_state` (`on`, `off`,
+  `cooldown`) in `system/init`, and so does the bridge. The web app draws
+  nothing for it.
 - Some of the app's own never reach the bridge as text, so the bridge has no
   command of that name: `/plan` is `set_permission_mode`, `/permissions`
   opens the mode menu, `/rename <title>` retitles the session and sends

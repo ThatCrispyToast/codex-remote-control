@@ -18,8 +18,9 @@ OPENED = {
     "collaborationMode": {"mode": "default"},
 }
 MODELS = {"data": [
-    {"id": "gpt-x", "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]},
-    {"id": "gpt-y", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]},
+    {"id": "gpt-x", "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}],
+     "serviceTiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}]},
+    {"id": "gpt-y", "supportedReasoningEfforts": [{"reasoningEffort": "low"}], "serviceTiers": []},
 ]}
 
 
@@ -482,7 +483,7 @@ def test_the_apps_mode_menu_changes_the_threads_settings(bridge):
 def test_settings_that_did_not_move_are_not_announced_again(bridge):
     bridge._from_codex(note("thread/settings/updated", threadSettings={
         "model": "gpt-x", "effort": "low", "cwd": "/w", "approvalPolicy": "on-request", "approvalsReviewer": "user",
-        "sandboxPolicy": {"type": "readOnly"}, "collaborationMode": {"mode": "default"}, "serviceTier": "fast"}))
+        "sandboxPolicy": {"type": "readOnly"}, "collaborationMode": {"mode": "default"}, "serviceTier": "default"}))
     assert bridge.worker.log == []
 
 
@@ -531,6 +532,30 @@ def test_a_claude_model_picked_in_the_app_is_explained_once(bridge):
 def test_an_effort_the_model_lacks_is_refused(bridge):
     bridge._from_controller(control("apply_flag_settings", settings={"effortLevel": "max"}))
     assert bridge.worker.calls("reject")[0][1] == "`gpt-x` has no effort 'max'. It takes: low, high"
+    assert bridge.codex.sent("thread/settings/update") == []
+
+
+def test_fast_mode_is_the_models_fast_service_tier(bridge):
+    """Claude Code's `/fast`, bare or with `on` or `off`. Codex names the tier and what it costs."""
+    bridge._from_controller(user("/fast"))
+    assert bridge.worker.events()[0]["message"]["content"][0]["text"] == "Fast mode on, from the next turn: 2x speed, increased usage."
+    bridge._from_codex(note("thread/settings/updated", threadSettings={**bridge.settings, "serviceTier": "priority"}))
+    init = bridge.worker.events()[-1]
+    assert (init["subtype"], init["fast_mode_state"]) == ("init", "on")  # as a Claude Code worker reports it
+    bridge._from_controller(user("/fast", seq=2))  # bare, it is the other of the two
+    bridge._from_controller(user("/fast on", seq=3))
+    bridge._from_controller(user("/fast off", seq=4))
+    assert [sent["serviceTier"] for sent in bridge.codex.sent("thread/settings/update")] == [
+        "priority", "default", "priority", "default"]
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "Fast mode off, from the next turn."
+
+
+def test_fast_mode_is_refused_where_there_is_none(bridge):
+    bridge._from_controller(user("/fast sometimes"))
+    assert bridge.worker.events()[0]["message"]["content"][0]["text"] == "`/fast` takes `on` or `off`."
+    bridge.settings["model"] = "gpt-y"
+    bridge._from_controller(user("/fast on", seq=2))
+    assert bridge.worker.events()[-1]["message"]["content"][0]["text"] == "`gpt-y` has no Fast mode."
     assert bridge.codex.sent("thread/settings/update") == []
 
 
@@ -632,10 +657,10 @@ def test_slash_commands_are_answered_without_a_turn(bridge):
 
 def test_a_command_this_session_lacks_never_reaches_the_model(bridge):
     """The app passes on the commands it doesn't run itself, as text."""
-    bridge._from_controller(user("/fast"))
+    bridge._from_controller(user("/rewind"))
     bridge._from_controller(user("/Frobnicate now", seq=2))
     said = [event["message"]["content"][0]["text"] for event in bridge.worker.events()]
-    assert said[0].startswith("`/fast` isn't available on a Codex session. This one takes `/clear`, `/codex`, `/compact`")
+    assert said[0].startswith("`/rewind` isn't available on a Codex session. This one takes `/clear`, `/codex`, `/compact`")
     assert said[1].startswith("`/frobnicate` isn't available")
     assert bridge.codex.sent("turn/start") == []
     bridge._from_controller(user("/tmp is full, what can go?", seq=3))  # a path, not a command
@@ -670,14 +695,15 @@ def test_clear_starts_a_thread_and_empties_the_transcript(bridge):
 
 
 def test_the_new_thread_starts_as_the_last_one_stood(bridge):
-    """Its mode, sandbox and effort were set in the app, and a `/clear` is no reason to lose them."""
+    """Its mode, sandbox, effort and Fast mode were set in the app, and a `/clear` is no reason to lose them."""
+    bridge.settings["serviceTier"] = "priority"
     bridge.codex.results["thread/start"] = NEW
     bridge._from_controller(user("/new"))  # Codex's name for it
     assert bridge.codex.sent("thread/settings/update") == [{
-        "threadId": "thr-2", "effort": "low", "approvalPolicy": "on-request", "approvalsReviewer": "user",
-        "sandboxPolicy": {"type": "readOnly"}, "collaborationMode": {"mode": "default"}}]
+        "threadId": "thr-2", "effort": "low", "serviceTier": "priority", "approvalPolicy": "on-request",
+        "approvalsReviewer": "user", "sandboxPolicy": {"type": "readOnly"}, "collaborationMode": {"mode": "default"}}]
     init = bridge.worker.events()[1]
-    assert (init["subtype"], init["permissionMode"], init["effort"]) == ("init", "default", "low")
+    assert (init["subtype"], init["permissionMode"], init["effort"], init["fast_mode_state"]) == ("init", "default", "low", "on")
     refused = Bridge(Codex(), Worker(), OPENED)
     refused.codex.results["thread/start"] = NEW
     refused.codex.refuse.add("thread/settings/update")
@@ -746,11 +772,12 @@ def test_the_codex_command_reports_what_the_apps_cards_leave_out(bridge):
     bridge.codex.results["account/rateLimits/read"] = {"rateLimits": {
         "primary": {"usedPercent": 23.4, "windowDurationMins": 300, "resetsAt": None}, "secondary": None, "planType": "plus"}}
     bridge._from_codex(note("thread/tokenUsage/updated", tokenUsage={"last": {"totalTokens": 1500}, "modelContextWindow": 3000}))
+    bridge.settings["serviceTier"] = "priority"
     bridge._from_controller(user("/codex"))
     assert bridge.worker.events()[0]["message"]["content"][0]["text"].splitlines() == [
         "**Codex 0.170.0**",
         "- Thread: `thr-1` in `/w`",
-        "- Model: `gpt-x`, effort `low`",
+        "- Model: `gpt-x`, effort `low`, Fast mode",
         "- Sandbox: read-only, network off. Approvals: asks you when it needs more.",
         "- Context: 1.5k of 3.0k tokens (50%)",
         "- Usage: 23% of the 5-hour limit used",

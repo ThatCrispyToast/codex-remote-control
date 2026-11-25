@@ -27,7 +27,7 @@ Open the link it prints, or pick the session under **Remote Control** in Claude.
   answer there
 - Changes and Files panels, `@` file mentions, attachments, `/btw` side questions
 - Slash commands: a fresh thread, ending the session, model, reasoning effort,
-  compaction, review, background terminals
+  Fast mode, compaction, review, background terminals
 - Terminal and Claude on the same thread at once
 
 ## Installation
@@ -92,10 +92,11 @@ Typed in the chat box:
 
 | Command | Action |
 | --- | --- |
-| `/clear` | Start a new thread in the same session, with the same directory, model and mode. The old thread is kept. Also `/new` |
+| `/clear` | Start a new thread in the same session, with the same directory, model, speed and mode. The old thread is kept. Also `/new` |
 | `/exit` | Stop the running turn, take the thread off Remote Control and end the session. Also `/quit` |
 | `/model <id>` | Change the Codex model |
 | `/effort [level]` | Show or change reasoning effort |
+| `/fast [on\|off]` | Turn Codex's Fast mode on or off: faster answers that use more of the plan |
 | `/compact` | Compact the thread's context |
 | `/review [instructions]` | Review the uncommitted changes, or what you describe |
 | `/btw <question>` | Ask a side question without adding to the thread |
@@ -123,7 +124,7 @@ Approval cards offer **Deny** and **Allow once**. A command's card adds
 ## Limitations
 
 - Unofficial. Uses Anthropic's private Remote Control protocol and the
-  experimental Codex app-server API. Tested with Codex 0.170.0 and
+  experimental Codex app-server API. Tested with Codex 0.172.0 and
   claude.ai/code on 2026-11-25.
 - A Codex started with `-c`, `--enable`, `--disable` or `--search` can't be
   joined ("already has an active writer").
