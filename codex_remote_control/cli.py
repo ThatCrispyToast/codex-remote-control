@@ -19,7 +19,7 @@ from claude_rc import (
     WorkerEvicted,
 )
 
-from . import __version__, background, workspace
+from . import __version__, background, mcp, workspace
 from .appserver import AppServer, AppServerClosed, AppServerError, remote_socket, resume_command
 from .bridge import TITLE_PREFIX, Bridge, Exited, ThreadClosed, session_title
 
@@ -245,9 +245,16 @@ def main(argv: list[str] | None = None) -> int:
         help="serve from the app-server listening there (`codex app-server --listen unix://PATH`), as "
         f"`codex --remote` joins it (default: ${REMOTE_ENV}, else Codex's shared background server)",
     )
+    parser.add_argument(
+        "--mcp", action="store_true",
+        help="be the MCP server that gives Codex its send_file tool, for files to reach the app "
+        f"(what `codex mcp add {mcp.SERVER} -- codex-rc --mcp` has Codex run)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="log what crosses the bridge")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
+    if args.mcp:
+        return mcp.serve()
     args.name = " ".join(args.name).strip() or None
     if args.thread and args.last:
         parser.error("give --thread or --last, not both")

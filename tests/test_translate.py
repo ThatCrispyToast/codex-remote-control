@@ -111,6 +111,29 @@ def test_mcp_calls_and_web_searches_keep_their_names():
     assert translate.tool_calls({"type": "contextCompaction", "id": "c"}) == []
 
 
+def test_a_file_codex_sends_is_claudes_send_user_file():
+    """codex-rc's own MCP tool, as Codex 0.172.0 reports a call of it."""
+    delivered = {"caption": "The plot.", "attachments": [
+        {"path": "/w/plot.png", "size": 4, "isImage": True, "media_type": "image/png", "file_uuid": "f-1"}]}
+    item = {"type": "mcpToolCall", "id": "m", "server": "codex-rc", "tool": "send_file", "status": "completed",
+            "arguments": {"files": ["plot.png"], "caption": "The plot."}, "error": None,
+            "result": {"content": [{"type": "text", "text": "Sent to the user: plot.png"}], "structuredContent": delivered, "_meta": None}}
+    assert translate.tool_calls(item) == [{
+        "type": "tool_use", "id": "m", "name": "SendUserFile", "input": {"files": ["plot.png"], "caption": "The plot."}}]
+    _, result = translate.transcript(item, "gpt-x")
+    assert result["tool_use_result"] == delivered  # the app draws the file cards from this
+    assert result["message"]["content"][0]["content"] == "Sent to the user: plot.png"
+    # a call that sent nothing ends failed, with no structured content
+    failed = {**item, "status": "failed", "result": {"content": [{"type": "text", "text": "Not sent"}], "structuredContent": None}}
+    _, result = translate.transcript(failed, "gpt-x")
+    assert "tool_use_result" not in result and result["message"]["content"][0]["is_error"] is True
+    assert translate.sent({**item, "status": "inProgress", "result": None}) is None  # as it starts
+    # another server's tool of that name is its own
+    other = {**item, "server": "mail"}
+    assert translate.tool_calls(other)[0]["name"] == "mcp__mail__send_file"
+    assert "tool_use_result" not in translate.transcript(other, "gpt-x")[1]
+
+
 def test_codexs_other_tools_take_the_nearest_claude_name():
     viewed = {"type": "imageView", "id": "i", "path": "/w/shot.png"}
     assert translate.tool_calls(viewed)[0]["name"] == "Read" and translate.tool_calls(viewed)[0]["input"] == {"file_path": "/w/shot.png"}

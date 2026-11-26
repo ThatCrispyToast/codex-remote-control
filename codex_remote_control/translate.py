@@ -6,8 +6,9 @@ permission prompts, a permission mode. These functions restate what Codex's
 app-server reports in those terms. They are pure: the bridge does the I/O.
 
 Tool calls take the names of Claude Code's own tools (`Bash`, `Write`, `Edit`,
-`WebSearch`, `TodoWrite`) because the app draws those properly: a command as a
-command, an edit as a diff, a plan as a checklist.
+`WebSearch`, `TodoWrite`, `SendUserFile`) because the app draws those
+properly: a command as a command, an edit as a diff, a plan as a checklist, a
+file sent as a card.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from claude_rc import (
     worker_status,
     worker_tool_result,
 )
+
+from . import mcp
 
 # A tool's output past this many characters is cut: the app is for following
 # along, and one event has a size limit.
@@ -150,6 +153,22 @@ def _file_change(change: dict) -> tuple[str, dict]:
     return "Edit", {"file_path": change["path"], "old_string": old, "new_string": new}
 
 
+def sends(item: dict) -> bool:
+    """Whether a thread item is a call of codex-rc's own tool, `send_file`,
+    which is Claude Code's `SendUserFile` in all but name: it takes the same
+    input and answers with the same result (see mcp.py)."""
+    return item["type"] == "mcpToolCall" and (item["server"], item["tool"]) == (mcp.SERVER, mcp.TOOL)
+
+
+def sent(item: dict) -> dict | None:
+    """What a `send_file` call delivered, as `SendUserFile` reports it: the
+    caption and the files, each with the id of its upload. It goes beside the
+    call's result, and the app draws its file cards from it. None for any
+    other item, and for a call that sent nothing."""
+    delivered = (item.get("result") or {}).get("structuredContent") if sends(item) else None
+    return delivered if isinstance(delivered, dict) and delivered.get("attachments") else None
+
+
 def tool_calls(item: dict) -> list[dict]:
     """The `tool_use` blocks a thread item amounts to: one for a command, an
     MCP call or a web search, one per file for a patch, none for anything that
@@ -159,6 +178,8 @@ def tool_calls(item: dict) -> list[dict]:
         calls = [("Bash", {"command": shell_script(item["command"])})]
     elif kind == "fileChange":
         calls = [_file_change(change) for change in item["changes"]]
+    elif sends(item):
+        calls = [("SendUserFile", item.get("arguments") or {})]
     elif kind == "mcpToolCall":
         calls = [(f"mcp__{item['server']}__{item['tool']}", item.get("arguments") or {})]
     elif kind == "webSearch":
@@ -237,7 +258,8 @@ def transcript(item: dict, model: str) -> list[dict]:
     if not calls:
         return []
     output, failed = tool_output(item)
-    return [worker_assistant(calls, model=model), *(worker_tool_result(c["id"], output, is_error=failed) for c in calls)]
+    results = (worker_tool_result(c["id"], output, is_error=failed, tool_use_result=sent(item)) for c in calls)
+    return [worker_assistant(calls, model=model), *results]
 
 
 def final(item: dict) -> bool:

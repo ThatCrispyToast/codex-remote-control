@@ -8,7 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Aniket Chadalavada" }]
 keywords = ["codex", "claude", "claude-code", "remote-control", "unofficial"]
 dependencies = [
-    "claude-rc-api @ git+https://github.com/ThatCrispyToast/claude-rc-api@3571ab6fe5d8911965164c0d2966878c7eeaaad3",
+    "claude-rc-api @ git+https://github.com/ThatCrispyToast/claude-rc-api@5c9ae2fa2699fe4319b560a8b39835039acc61f0",
     "httpx>=0.27",
     "websockets>=13",
 ]

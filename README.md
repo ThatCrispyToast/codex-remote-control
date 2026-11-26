@@ -26,6 +26,7 @@ Open the link it prints, or pick the session under **Remote Control** in Claude.
 - Commands, edits and approval requests in the chat, and Codex's questions to
   answer there
 - Changes and Files panels, `@` file mentions, attachments, `/btw` side questions
+- Files from Codex in the chat, to open or download ([one line to set up](#files-from-codex))
 - Slash commands: a fresh thread, ending the session, model, reasoning effort,
   Fast mode, compaction, review, background terminals
 - Terminal and Claude on the same thread at once
@@ -85,6 +86,26 @@ codex-rc --stop --thread <thread-id>   # stop that one
   as for any stop that was asked for, and 1 after a failure.
 - In a side conversation, `!codex-rc` serves the thread it came from. A temporary
   one can't tell which that is, and says to type it in the main thread.
+
+### Files from Codex
+
+```sh
+codex mcp add codex-rc -- codex-rc --mcp   # once
+```
+
+That gives Codex a `send_file` tool, in the sessions started from then on. Ask
+for a file ("send me the plot") and it arrives in the chat as a card to open or
+download, a picture as a picture. Claude Code's own sessions send files the
+same way.
+
+- The server's name has to be `codex-rc`: the bridge knows the tool by it.
+- Codex runs the tool without asking, in every mode, as it reads a file
+  without asking.
+- A file is uploaded to your Claude account's file store. Up to 30 MiB.
+- In Claude on the web a picture opens from that upload. Any other file opens
+  from this machine, so one outside the thread's directory can be downloaded
+  but not opened there.
+- In a session that is not on Remote Control the tool sends nothing and says so.
 
 ### In Claude
 
@@ -154,6 +175,7 @@ uv run codex-rc --help          # the working tree's command
 | `codex_remote_control/bridge.py` | Event loop between the thread and the session |
 | `codex_remote_control/translate.py` | Codex items, approvals and settings in Claude Code's terms |
 | `codex_remote_control/workspace.py` | Changes and Files panels, from the thread's directory |
+| `codex_remote_control/mcp.py` | The `send_file` tool, as the MCP server Codex runs |
 | `codex_remote_control/background.py` | Background bridges: lock records, logs, attached files |
 | `tests/` | Offline suite |
 

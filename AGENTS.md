@@ -104,6 +104,31 @@ what neither the README nor the code will tell you.
   `default` for standard speed, set with `thread/settings/update` for the
   turns after. `fast` is taken for `priority`. Any other string is taken as
   it is, unchecked, like a model id.
+- **A tool of one's own is an MCP server** (0.172.0). A client's own tools,
+  `dynamicTools`, are taken by `thread/start` and not by `thread/resume`, so
+  a thread joined from a TUI can't be given one. Every thread has the MCP
+  servers of Codex's config, which is why `send_file` is one.
+- Codex starts **an MCP server for each thread**, as a child of the
+  app-server: in the thread's directory, with the app-server's environment
+  (no `CODEX_THREAD_ID`), and outside the sandbox whatever the thread's mode,
+  with the network and the whole disk. Each `tools/call` names its thread in
+  `_meta.threadId`. One the model made also has `callId`, the item's id.
+- **Codex asks before an MCP tool runs, unless the tool says it is
+  read-only.** One with `annotations.readOnlyHint: true` runs unasked in
+  every mode. One with no annotations, or with `readOnlyHint: false`, is
+  asked about (`mcpServer/elicitation/request`, `codex_approval_kind:
+  "mcp_tool_call"`) in read-only and workspace mode. The reviewer answers
+  under `auto_review`, and nothing asks under full access.
+- An `mcpToolCall` item's `server` is the name in Codex's config. Its
+  `result` keeps the tool's `structuredContent` beside `content`. A result
+  with `isError: true` ends the item `failed`, with `content` kept and
+  `structuredContent` null.
+- Codex asks an MCP server for `resources/list` and
+  `resources/templates/list` whatever capabilities it declared. Answered
+  with an error, the server is still `connected`.
+- `codex mcp add` writes the server to `~/.codex/config.toml`. A running
+  app-server gives it to the threads started after that. A thread already
+  loaded answers "unknown MCP server" until `config/mcpServer/reload`.
 - The TUI's own `/new` and `/clear` move that TUI to a new thread. Nothing in
   the app-server moves a TUI from outside, so a terminal on the thread stays
   on the old one after the bridge's `/clear`.
@@ -170,6 +195,15 @@ what neither the README nor the code will tell you.
   GitHub remote gets no Changes panel, as with Claude Code.
 - `@` mentions and the Files panel are `file_suggestions` (`""`, typed text,
   or `"dir/"`) and `read_file`. `/btw` is `side_question`.
+- **A file card** is the result of a `SendUserFile` call. The `user` event
+  of its `tool_result` carries `tool_use_result: {caption, attachments:
+  [{path, size, isImage, media_type, file_uuid}]}`, each `file_uuid` an
+  upload's (`POST /api/oauth/file_upload`, with the account's login). The app
+  writes the caption, draws a card for each file and lists them under
+  Outputs. A picture opens from the upload. Any other file opens in the file
+  viewer, which asks for it by its path (`read_file`): one outside the
+  thread's directory reads "Can't read this file" there and still downloads.
+  A call that failed reads "Sending file Failed".
 - Attached files arrive as `file_attachments` on the user message, to be
   fetched with the account's login (`download_file`).
 - "Always allow" shows on a card only for a `permission_suggestions` rule
@@ -241,6 +275,10 @@ what neither the README nor the code will tell you.
   with `num_turns: 0` and no turn id.
 - Files attached in the app are saved under `uploads/<thread id>/` in the
   state directory, and removed when the thread is closed.
+- A file Codex sent is kept by claude.ai, in the account's file store, and
+  named in the thread: the `send_file` item's result holds the upload's id.
+  The bridge keeps nothing of it, and writes the card again from the item
+  wherever it reads the thread.
 - What a wrapper reads is on stdout: `thread <id>  (<directory>)` first and
   again after each `/clear`, and `exit     typed in the app` last when `/exit`
   ended the bridge. The exit status does not tell `/exit` from a stop: both
@@ -274,6 +312,14 @@ Codex plan and a real Claude account:
   without daemon this time". That TUI is embedded and can't be joined, so test
   a saved side conversation with `CODEX_THREAD_ID=<its id> codex-rc` once the
   TUI has quit.
+- `send_file` can be tested without touching Codex's config. An app-server
+  of your own takes the server as `-c
+  'mcp_servers.codex-rc.command="<checkout>/.venv/bin/codex-rc"' -c
+  'mcp_servers.codex-rc.args=["--mcp"]'`, and `mcpServer/tool/call` runs a
+  tool on a thread without a turn. `codex mcp add` under an empty
+  `CODEX_HOME` writes there, and an app-server on it starts threads without a
+  login. Every file sent stays on the account and counts against its
+  allowance of uploads.
 - Leave nothing running: stop the bridges a test started (`codex-rc --stop`)
   and check the state directory is empty.
 - `uv run` syncs the environment to the lockfile, so it cannot run against an
